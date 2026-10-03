@@ -1,3 +1,5 @@
+import asyncio
+import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,13 +9,46 @@ from app.api.v1.api import api_router
 from app.api.v1.endpoints.health import health_check
 from app.core.config import settings
 from app.db.redis import close_redis, init_redis
+from app.services.evidence_service import evidence_service
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Manage application lifecycle resources (e.g., Redis connection pool)."""
+    """Manage application lifecycle resources (e.g., Redis connection pool and reconciliation)."""
     await init_redis()
+
+    # Startup reconciliation sweep
+    try:
+        await evidence_service.run_reconciliation()
+    except Exception as e:
+        logger.error("Startup evidence reconciliation failed: %s", str(e))
+
+    # Periodic background reconciliation worker
+    async def reconciliation_worker():
+        while True:
+            try:
+                await asyncio.sleep(settings.RECONCILIATION_INTERVAL_MINUTES * 60)
+                await evidence_service.run_reconciliation()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Scheduled evidence reconciliation error: %s", str(e))
+
+    reconciliation_task = asyncio.create_task(reconciliation_worker())
+
     yield
+
+    # Clean shutdown
+    reconciliation_task.cancel()
+    try:
+        await reconciliation_task
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        pass
+
     await close_redis()
 
 
@@ -39,7 +74,7 @@ if settings.BACKEND_CORS_ORIGINS:
         allow_origins=settings.BACKEND_CORS_ORIGINS,
         allow_credentials=False,
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type", "Accept"],
+        allow_headers=["Authorization", "Content-Type", "Accept", "X-Case-Code"],
     )
 
 # Top-level health check endpoint for orchestrators / root probes

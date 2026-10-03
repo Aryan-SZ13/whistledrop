@@ -24,3 +24,7 @@ pytest-asyncio==1.4.0
 # Rate Limiting & Abuse Resistance (Async Redis Client)
 redis[hiredis]==8.1.0
 
+# Evidence Attachments & File Validation (Phase 8)
+python-magic==0.4.27
+python-multipart==0.0.32
+

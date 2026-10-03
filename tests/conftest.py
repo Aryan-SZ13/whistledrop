@@ -28,14 +28,16 @@ TestAsyncSession = async_sessionmaker(
 @pytest_asyncio.fixture(autouse=True)
 async def clean_database():
     """Ensure complete database table isolation before and after every test."""
+    from app.services.evidence_service import evidence_service
+    evidence_service.db_engine = test_engine
     async with test_engine.begin() as conn:
         await conn.execute(
-            sa.text("TRUNCATE reports, moderators, report_updates, audit_logs CASCADE")
+            sa.text("TRUNCATE reports, moderators, report_updates, audit_logs, evidence_attachments CASCADE")
         )
     yield
     async with test_engine.begin() as conn:
         await conn.execute(
-            sa.text("TRUNCATE reports, moderators, report_updates, audit_logs CASCADE")
+            sa.text("TRUNCATE reports, moderators, report_updates, audit_logs, evidence_attachments CASCADE")
         )
 
 

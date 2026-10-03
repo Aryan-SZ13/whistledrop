@@ -11,15 +11,16 @@ WhistleDrop is structured as an asynchronous Python backend adhering to clean ar
 ```text
 whistledrop/
 ├── .env.example              # Template for environment configuration & secrets
-├── .gitignore                # Git ignore rules for virtual environments, secrets, caches
+├── .gitignore                # Git ignore rules for virtual environments, secrets, caches, storage
 ├── alembic.ini               # Alembic database migration configuration
-├── docker-compose.yml        # Development PostgreSQL and Redis service containers
+├── docker-compose.yml        # Development PostgreSQL, Redis, and ClamAV service containers
 ├── requirements.txt          # Reproducible, pinned Python dependencies
 ├── README.md                 # Architecture, privacy/security models, and setup guide
 ├── alembic/
 │   ├── env.py                # Async migration runner linked to model metadata
 │   ├── script.py.mako        # Migration template
 │   └── versions/             # Versioned schema migrations
+├── evidence_storage/         # Local partitioned attachment storage (quarantine & approved)
 ├── app/
 │   ├── __init__.py           # Package marker with application version
 │   ├── main.py               # FastAPI entrypoint, lifespan, CORS, and route mounting
@@ -35,19 +36,23 @@ whistledrop/
 │   ├── models/
 │   │   ├── __init__.py       # Model exports
 │   │   ├── base.py           # DeclarativeBase base model class
-│   │   ├── enums.py          # Domain enums (ReportCategory, ReportStatus, ModeratorRole, ReportUpdateType)
+│   │   ├── enums.py          # Domain enums (ReportCategory, ReportStatus, ModeratorRole, ReportUpdateType, EvidenceScanStatus)
 │   │   ├── moderator.py      # Moderator accounts and roles
 │   │   ├── report.py         # Core whistleblower report schema
 │   │   ├── report_update.py  # Moderator case status updates and internal notes
-│   │   └── audit_log.py      # Action audit logs
+│   │   ├── audit_log.py      # Action audit logs
+│   │   └── evidence.py       # Evidence attachment metadata and scan state
 │   ├── schemas/
 │   │   ├── __init__.py       # Pydantic schemas export
 │   │   ├── auth.py           # Moderator login and token schemas
 │   │   ├── moderator.py      # Moderator report listing, status update, and note schemas
-│   │   └── report.py         # Public request and response schemas
+│   │   ├── report.py         # Public request and response schemas
+│   │   └── evidence.py       # Evidence upload and moderator view schemas
 │   ├── services/
 │   │   ├── __init__.py       # Services export
 │   │   ├── auth_service.py   # Moderator authentication, hashing, and token issuance
+│   │   ├── clamav_service.py # Asynchronous ClamAV client via INSTREAM protocol
+│   │   ├── evidence_service.py # Validation, storage, atomic promotion, and reconciliation
 │   │   ├── moderator_service.py # Protected report querying, filtering, and status transitions
 │   │   ├── rate_limiter.py   # Redis sliding-window rate limiter with atomic Lua scripts
 │   │   └── report_service.py # Core business logic for report submission and tracking
@@ -61,14 +66,16 @@ whistledrop/
 │               ├── __init__.py
 │               ├── auth.py   # Moderator authentication endpoints (rate limited)
 │               ├── health.py # Health check probe endpoint
-│               ├── moderator.py # Protected moderator report management routes
-│               └── reports.py# Anonymous report submission & tracking endpoints (rate limited)
+│               ├── moderator.py # Protected moderator report & evidence management routes
+│               └── reports.py# Anonymous report submission, evidence upload & tracking endpoints
 └── tests/
     ├── __init__.py
     ├── conftest.py           # Test database & Redis fixtures, isolation, and session setup
     ├── test_auth.py          # Argon2id, JWT lifecycle, RBAC, and login tests
     ├── test_config.py        # Configuration, CORS, and secret validation tests
     ├── test_database.py      # Database models, constraints, enums, and schema tests
+    ├── test_evidence.py      # Evidence upload, validation, ClamAV, promotion, and reconciliation
+    ├── test_evidence_config.py # Evidence configuration bounds and cross-field checks
     ├── test_health.py        # Health and root endpoint tests
     ├── test_moderator.py     # Protected moderator control plane & lifecycle tests
     ├── test_rate_limiting.py # Sliding-window rate limiting, privacy, proxy, and outage tests
@@ -183,8 +190,6 @@ Security controls are implemented with defense-in-depth:
 
 | Threat | Target / Impact | Mitigation Strategy |
 | :--- | :--- | :--- |
-| Threat | Target / Impact | Mitigation Strategy |
-| :--- | :--- | :--- |
 | **Case-Code Enumeration / Brute Force** | Adversaries guessing case codes to view confidential reports. | High-entropy CSPRNG tokens (192 bits), keyed HMAC digests (`CASE_CODE_SECRET`), per-client sliding window rate limiting, and atomic global safeguard limiting. |
 | **Traffic Correlation / Metadata Leakage** | Correlating report submissions with network traffic or server logs. | Application models and application logs omit submitter identity and network metadata; infrastructure ingress proxies must be configured to discard or anonymize access logs. |
 | **Cross-Domain Secret Compromise** | Compromise of one cryptographic secret impacting other security contexts. | Three-way cryptographic secret separation; `JWT_SECRET`, `CASE_CODE_SECRET`, and `RATE_LIMIT_KEY_SECRET` are independent keys validated to never share values. |
@@ -192,6 +197,11 @@ Security controls are implemented with defense-in-depth:
 | **Unauthorized Moderator Access** | Malicious actors accessing case management records. | Argon2id password hashing, canonical username normalization, active account verification (`is_active`), Role-Based Access Control (RBAC), context-bound JWTs, and structured audit logs. |
 | **Automated Credential Spraying** | Rapid brute-force attacks against moderator login. | Sliding window rate limiting (5 req / 5 min), dummy Argon2id timing equalization, and fail-closed service protection. |
 | **Request Flooding / Denial of Service** | Flooding anonymous submission endpoints to exhaust storage. | Ephemeral sliding window rate limiting (5 req / 5 min per client bucket) with atomic Lua evaluation. |
+| **Malicious Evidence Uploads / Malware** | Upload of malicious payloads targeting moderator analysis environments. | Strict 4-tier validation (6 allowed types: PDF, PNG, JPEG, WEBP, TXT, CSV), quarantine storage isolation, async ClamAV INSTREAM scanning, fail-closed error handling, and unlinking of infected files. |
+| **Archive Bombs / Zip Slip Vulnerabilities** | Exploits abusing archive extraction or nested compression. | Total architectural prohibition on all archive formats (`.zip`, `.tar`, `.gz`, `.bz2`, `.xz`, `.7z`, `.rar`, etc.) enforced across extensions, client MIME, and `libmagic` content sniffing. |
+| **Storage Exhaustion / Resource DoS** | Flooding evidence upload with oversized or unconstrained files. | Hard streaming bounds (10 MiB per file, 25 MiB total per submission, max 5 attachments per report), row-level quota locking (`SELECT ... FOR UPDATE`), pre-flight free disk check ($\ge 1024$ MiB), and upload rate limiting. |
+| **Bearer Credential URL Leakage** | Plaintext case codes leaking into proxy, access, or browser logs. | Case codes are supplied exclusively via the `X-Case-Code` request header for evidence uploads; case codes never appear in URLs or log sinks. |
+| **IDOR / Unauthorized Evidence Access** | Malicious actors guessing evidence UUIDs to download confidential attachments. | Moderator JWT authentication required; direct downloads strictly verify report-evidence ownership, enforce `CLEAN` status, stream with `nosniff`, and synthesize unrevealing download filenames (`evidence-1.pdf`). |
 
 ---
 
@@ -276,6 +286,76 @@ Case tracking (`GET /api/v1/reports/{case_code}`) evaluates **both** the client-
 
 ---
 
+## Evidence Attachment Storage & Antivirus Scanning (Phase 8)
+
+WhistleDrop provides secure evidence attachment handling for whistleblowers while maintaining complete anonymity, strictly bound file-handling controls, and fail-closed antivirus scanning via ClamAV.
+
+### 1. Anonymous Upload & Credential Invariance
+- **No Case Code in URLs:** Uploads are submitted to `POST /api/v1/reports/evidence`. The anonymous uploader authenticates exclusively via the `X-Case-Code` request header. Case codes never appear in URLs, route parameters, or query strings, preventing token leakage into web server logs, proxy access logs, browser history, or monitoring traces.
+- **Log Privacy Guarantee:** WhistleDrop logs raw case codes under no circumstances. Case codes are immediately transformed into HMAC-SHA256 digests (`derive_case_code_digest`) before database report resolution.
+- **Client Metadata Erasure:** Original client filenames (`UploadFile.filename`) are entirely discarded at ingestion and never written to PostgreSQL or filesystem paths. Downloaded attachments are served with deterministic synthetic filenames (e.g. `evidence-1.pdf`).
+- **Public Case Tracking Isolation:** `GET /api/v1/reports/{case_code}` continues to return only public status and updates. Evidence attachment metadata, IDs, storage keys, and scan states are never exposed on public tracking endpoints.
+
+### 2. Strict 4-Tier File Validation Allowlist
+WhistleDrop restricts evidence files to exactly **6 allowed types**: `PDF`, `PNG`, `JPEG`, `WEBP`, `TXT`, and `CSV`. Every uploaded file must pass 4 verification tiers:
+1. **Extension Allowlist:** Case-insensitive match against `.pdf`, `.png`, `.jpg`, `.jpeg`, `.webp`, `.txt`, `.csv`.
+2. **Client Content-Type Verification:** Submitted MIME matches acceptable types for the extension.
+3. **Magic Byte / Content Sniffing (`libmagic`):** Deep inspection of initial bytes verifying authentic format headers (`%PDF-`, `\x89PNG\r\n\x1a\n`, `\xff\xd8\xff`, `RIFF...WEBP`).
+4. **Text / CSV Cleanliness:** For `.txt` and `.csv`, strict UTF-8 decoding is required, and binary content (e.g. embedded NULL bytes `\x00` or high binary control characters) is rejected with HTTP 422.
+
+*Anti-Archive & Anti-Executable Policy:* All archive formats (`.zip`, `.tar`, `.gz`, `.bz2`, `.xz`, `.7z`, `.rar`, etc.) and executables are prohibited across all tiers. This natively eliminates decompression bombs, zip slip directory traversal, and malicious script execution.
+
+### 3. Resource & Storage Limits
+- **Per-File Size Limit:** 10 MiB default (`MAX_ATTACHMENT_SIZE_MB = 10`), enforced as chunks are read from the socket. Streams exceeding 10 MiB abort immediately with HTTP 413 without reading the remainder of the payload.
+- **Per-Submission Cumulative Limit:** 25 MiB default (`MAX_TOTAL_ATTACHMENT_BYTES = 26214400`), tracked across all files in a multipart upload.
+- **Per-Report Attachment Quota:** Maximum 5 attachments per report (`MAX_ATTACHMENTS_PER_REPORT = 5`). Enforced under row-level database locks (`SELECT ... FOR UPDATE`) to prevent race conditions during concurrent submissions.
+- **Pre-Flight Disk Space Check:** Rejects uploads with HTTP 503 if free storage is below 1024 MiB (`MIN_FREE_STORAGE_MB = 1024`).
+- **Ephemeral Quarantine Isolation:** Ingested files are written directly into a dedicated `quarantine/` directory using random UUID storage keys (`<storage_key>.bin`). No unverified file is ever placed in public or approved paths.
+
+### 4. ClamAV Antivirus Scanning & Fail-Closed Semantics
+- **Asynchronous TCP Socket Client:** Communicates with ClamAV daemon (`clamd`) over an async TCP socket using the `INSTREAM` protocol.
+- **Streaming Chunks:** Files are streamed in 64 KiB chunks prefixed with 4-byte network-endian length prefixes, terminated with zero-length delimiter.
+- **Fail-Closed Strategy:** If ClamAV times out (`CLAMAV_TIMEOUT_SECONDS = 30`), is unreachable, or encounters an internal scanning error, the file remains in quarantine and transitions to `SCAN_FAILED`. It is never promoted to approved storage.
+- **Malware Handling:** If malware is detected (`FOUND`), the quarantine file is immediately deleted (`unlink`), the database status transitions to `INFECTED`, and an audit log warning is emitted.
+
+### 5. Crash-Safe State Machine & Atomic Promotion
+Evidence attachments transition through explicit lifecycle states:
+
+$$\text{PENDING\_SCAN} \longrightarrow \text{SCAN\_CLEAN} \longrightarrow \text{PROMOTING} \longrightarrow \text{CLEAN}$$
+$$\text{PENDING\_SCAN} \longrightarrow \text{INFECTED} \quad (\text{quarantine unlinked})$$
+$$\text{PENDING\_SCAN} \longrightarrow \text{SCAN\_FAILED} \quad (\text{fail-closed})$$
+
+- **Atomic Filesystem Promotion:** `quarantine/` and `approved/` reside on the same filesystem. When ClamAV returns `OK`:
+  1. DB transitions to `SCAN_CLEAN`.
+  2. DB transitions to `PROMOTING`.
+  3. `os.replace(quarantine_path, approved_path)` moves the file atomically.
+  4. Parent directory `fsync` provides directory entry filesystem durability according to the POSIX directory sync contract.
+  5. File size and SHA-256 hash of `approved_path` are re-verified against DB invariants for end-to-end content integrity verification (integrity check, distinct from filesystem durability).
+  6. DB transitions to `CLEAN`.
+  If a crash occurs during promotion, reconciliation safely recovers or rolls back the file.
+
+### 6. Multi-Worker Reconciliation & Orphan Cleanup
+To maintain consistency across process crashes or scanner latency:
+- **PostgreSQL Session Advisory Lock (`428910482910`):** Cross-process mutual exclusion ensures only one worker runs reconciliation at a time. The lock uses a single dedicated database connection with guaranteed session affinity.
+- **Full Crash-Recovery State Matrix:**
+  - Files stuck in `PROMOTING` or `SCAN_CLEAN` for $>15$ minutes are evaluated: if a valid file exists in `approved/` matching size and SHA-256 hash, DB is promoted to `CLEAN` and any leftover quarantine file is purged; if `approved/` is missing but `quarantine/` matches size and SHA-256 hash, `quarantine/` is atomically promoted to `approved/` via `os.replace` + `fsync` and DB becomes `CLEAN`; otherwise, any corrupted approved file is unlinked and DB transitions to `SCAN_FAILED`.
+  - Files stuck in `PENDING_SCAN` for $>24$ hours (`PENDING_SCAN_MAX_AGE_HOURS = 24`) transition to `SCAN_FAILED`.
+  - Active `CLEAN` records whose physical files are missing or fail size/SHA-256 verification transition to `SCAN_FAILED` (with any corrupted disk file unlinked).
+- **Terminal State Retention:** Records in `SCAN_FAILED` or `INFECTED` older than 72 hours (`QUARANTINE_RETENTION_HOURS = 72`) have all associated filesystem objects purged and transition to `DELETED`.
+- **Orphan File Cleanup:** Files in `quarantine/` unreferenced by the database and older than a 15-minute grace period are permanently purged.
+- **Lifecycle Integration:** Reconciliation executes on application startup and periodically in a background task (`RECONCILIATION_INTERVAL_MINUTES = 60`).
+
+### 7. Moderator Access & Secure Streaming Downloads
+- **Access Control:** `GET /api/v1/moderator/reports/{report_id}/evidence` and `GET /api/v1/moderator/reports/{report_id}/evidence/{evidence_id}` require active moderator JWT authentication.
+- **Relationship Verification:** The server strictly verifies that `attachment.report_id == report_id`. Mismatched requests return HTTP 404 (IDOR prevention).
+- **Status Gating:** Files in non-`CLEAN` status (`PENDING_SCAN`, `INFECTED`, `SCAN_FAILED`) return HTTP 403 Forbidden.
+- **Security Headers:** Downloads are streamed with:
+  - `Content-Disposition: attachment; filename="evidence-1.pdf"` (prevents in-browser active content rendering)
+  - `X-Content-Type-Options: nosniff` (prevents MIME sniffing)
+  - `Cache-Control: private, no-cache, no-store, must-revalidate` (prevents intermediate caching)
+
+---
+
 ## Development Roadmap
 
 - [x] **Phase 0:** Backend Foundation, Configuration & Health Check
@@ -291,7 +371,7 @@ Case tracking (`GET /api/v1/reports/{case_code}`) evaluates **both** the client-
 - [x] **Phase 6:** Case Lifecycle State Machine, Public/Internal Update Separation, and Auditing
 - [x] **Phase 6.1:** Least-Privilege Moderator Update Query Hardening
 - [x] **Phase 7:** Redis-Backed Abuse Resistance & Sliding-Window Rate Limiting
-- [ ] **Phase 8 (Planned):** Evidence Attachment Storage & Antivirus Scanning (ClamAV)
+- [x] **Phase 8:** Evidence Attachment Storage & Antivirus Scanning (ClamAV)
 
 ---
 
@@ -302,6 +382,8 @@ Case tracking (`GET /api/v1/reports/{case_code}`) evaluates **both** the client-
 - Python 3.10+ (Python 3.13 tested)
 - PostgreSQL 16
 - Redis 7+
+- ClamAV daemon (`clamd` on port 3310, e.g. via Docker Compose)
+- `libmagic` (`brew install libmagic` on macOS / `apt install libmagic1` on Debian/Ubuntu)
 
 ### 2. Environment Setup
 
@@ -324,9 +406,9 @@ cp .env.example .env
 
 Review and adjust variables in `.env` as needed for your development setup.
 
-### 4. Database & Migrations
+### 4. Database & Services
 
-Start the development database:
+Start the development database, cache, and antivirus daemon:
 
 ```bash
 docker compose up -d

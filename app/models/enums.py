@@ -29,3 +29,14 @@ class ModeratorRole(str, enum.Enum):
     MODERATOR = "MODERATOR"
     ADMIN = "ADMIN"
 
+
+class EvidenceScanStatus(str, enum.Enum):
+    """Lifecycle and scanning statuses for report evidence attachments."""
+    PENDING_SCAN = "PENDING_SCAN"
+    SCAN_CLEAN = "SCAN_CLEAN"
+    PROMOTING = "PROMOTING"
+    CLEAN = "CLEAN"
+    INFECTED = "INFECTED"
+    SCAN_FAILED = "SCAN_FAILED"
+    DELETED = "DELETED"
+

@@ -50,3 +50,4 @@ htmlcov/
 data/
 *.sqlite3
 *.db
+evidence_storage/

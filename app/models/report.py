@@ -10,6 +10,7 @@ from app.models.enums import ReportCategory, ReportStatus
 if TYPE_CHECKING:
     from app.models.report_update import ReportUpdate
     from app.models.audit_log import AuditLog
+    from app.models.evidence import EvidenceAttachment
 
 
 class Report(Base):
@@ -79,4 +80,9 @@ class Report(Base):
     audit_logs: Mapped[List["AuditLog"]] = relationship(
         "AuditLog",
         back_populates="report",
+    )
+    evidence_attachments: Mapped[List["EvidenceAttachment"]] = relationship(
+        "EvidenceAttachment",
+        back_populates="report",
+        cascade="all, delete-orphan",
     )
