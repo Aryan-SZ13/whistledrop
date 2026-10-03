@@ -259,12 +259,25 @@ async def test_pagination_and_deterministic_ordering(client, db_session: AsyncSe
 
 
 @pytest.mark.asyncio
-async def test_maximum_page_size_enforced(client, db_session: AsyncSession):
-    """Verify page size above maximum (100) is rejected by validation."""
+async def test_pagination_validation_enforced(client, db_session: AsyncSession):
+    """Verify invalid pagination inputs (limit > 100, limit < 1, offset < 0) return 422."""
     headers = await create_auth_headers(db_session)
 
-    response = client.get("/api/v1/moderator/reports?limit=101", headers=headers)
-    assert response.status_code == 422
+    # limit > 100
+    res_high = client.get("/api/v1/moderator/reports?limit=101", headers=headers)
+    assert res_high.status_code == 422
+
+    # limit < 1 (zero)
+    res_zero = client.get("/api/v1/moderator/reports?limit=0", headers=headers)
+    assert res_zero.status_code == 422
+
+    # limit < 1 (negative)
+    res_neg_limit = client.get("/api/v1/moderator/reports?limit=-5", headers=headers)
+    assert res_neg_limit.status_code == 422
+
+    # offset < 0
+    res_neg_offset = client.get("/api/v1/moderator/reports?offset=-1", headers=headers)
+    assert res_neg_offset.status_code == 422
 
 
 # ==============================================================================
@@ -328,3 +341,76 @@ async def test_public_anonymous_api_remains_unchanged(client):
     assert "updates" in track_data
     assert "id" not in track_data
     assert "description" not in track_data
+
+
+@pytest.mark.asyncio
+async def test_moderator_query_column_least_privilege(db_session: AsyncSession):
+    """Verify moderator service executes queries that select only the 7 intended columns."""
+    from app.services.moderator_service import moderator_service
+
+    # Create a report with a distinct description
+    r, _ = await report_service.create_report(
+        db_session,
+        ReportCreate(category=ReportCategory.CORRUPTION, description="Financial audit irregularity"),
+    )
+
+    # Track executed statements and their selected column names
+    executed_statements = []
+
+    original_execute = db_session.execute
+
+    async def tracking_execute(statement, *args, **kwargs):
+        executed_statements.append(statement)
+        return await original_execute(statement, *args, **kwargs)
+
+    db_session.execute = tracking_execute
+    try:
+        # 1. Test list_reports query columns
+        items, total = await moderator_service.list_reports(db_session, limit=10, offset=0)
+        assert len(items) >= 1
+        assert total >= 1
+
+        # Check statement columns
+        # The second statement executed in list_reports is the items query
+        items_stmt = executed_statements[1]
+        selected_columns = [col.name for col in items_stmt.selected_columns]
+        expected_columns = [
+            "id",
+            "category",
+            "description",
+            "evidence_url",
+            "status",
+            "created_at",
+            "updated_at",
+        ]
+        assert selected_columns == expected_columns
+        assert "case_code_digest" not in selected_columns
+
+        # 2. Test get_report_by_id query columns
+        executed_statements.clear()
+        detail_item = await moderator_service.get_report_by_id(db_session, r.id)
+        assert detail_item is not None
+        assert detail_item.id == r.id
+
+        detail_stmt = executed_statements[0]
+        detail_columns = [col.name for col in detail_stmt.selected_columns]
+        assert detail_columns == expected_columns
+        assert "case_code_digest" not in detail_columns
+    finally:
+        db_session.execute = original_execute
+
+
+@pytest.mark.asyncio
+async def test_moderator_service_defensive_bounds_validation(db_session: AsyncSession):
+    """Verify moderator_service raises ValueError if called with invalid limit or offset directly."""
+    from app.services.moderator_service import moderator_service
+
+    with pytest.raises(ValueError, match="limit must be between 1 and 100"):
+        await moderator_service.list_reports(db_session, limit=0)
+
+    with pytest.raises(ValueError, match="limit must be between 1 and 100"):
+        await moderator_service.list_reports(db_session, limit=101)
+
+    with pytest.raises(ValueError, match="offset must be non-negative"):
+        await moderator_service.list_reports(db_session, offset=-1)
+

@@ -32,9 +32,11 @@ class ModeratorService:
         Returns:
             Tuple[List[ModeratorReportResponse], int]: (items, total_count)
         """
-        # Enforce bounded pagination
-        safe_limit = max(1, min(limit, 100))
-        safe_offset = max(0, offset)
+        # Enforce bounded pagination defensively
+        if limit < 1 or limit > 100:
+            raise ValueError("limit must be between 1 and 100")
+        if offset < 0:
+            raise ValueError("offset must be non-negative")
 
         filters = []
         if status is not None:
@@ -49,30 +51,40 @@ class ModeratorService:
         total_res = await db.execute(count_stmt)
         total = total_res.scalar() or 0
 
-        # 2. Paginated items query
-        stmt = sa.select(Report)
+        # 2. Paginated items query - least-privilege column selection
+        # Strictly selects only fields required by ModeratorReportResponse.
+        # Sensitive fields such as case_code_digest and unneeded relations are excluded.
+        stmt = sa.select(
+            Report.id,
+            Report.category,
+            Report.description,
+            Report.evidence_url,
+            Report.status,
+            Report.created_at,
+            Report.updated_at,
+        )
         if filters:
             stmt = stmt.where(*filters)
         stmt = (
             stmt.order_by(Report.created_at.desc(), Report.id.desc())
-            .limit(safe_limit)
-            .offset(safe_offset)
+            .limit(limit)
+            .offset(offset)
         )
         result = await db.execute(stmt)
-        reports = result.scalars().all()
+        rows = result.all()
 
-        # 3. Explicit mapping to moderator response schemas (omitting case_code_digest and internals)
+        # 3. Explicit mapping from selected columns to moderator response schemas
         items = [
             ModeratorReportResponse(
-                id=r.id,
-                category=r.category,
-                description=r.description,
-                evidence_url=r.evidence_url,
-                status=r.status,
-                created_at=r.created_at,
-                updated_at=r.updated_at,
+                id=row.id,
+                category=row.category,
+                description=row.description,
+                evidence_url=row.evidence_url,
+                status=row.status,
+                created_at=row.created_at,
+                updated_at=row.updated_at,
             )
-            for r in reports
+            for row in rows
         ]
 
         return items, total
@@ -82,22 +94,33 @@ class ModeratorService:
         db: AsyncSession,
         report_id: uuid.UUID,
     ) -> Optional[ModeratorReportResponse]:
-        """Retrieve a single report by internal UUID with moderator response minimization."""
-        stmt = sa.select(Report).where(Report.id == report_id)
-        result = await db.execute(stmt)
-        r = result.scalar_one_or_none()
+        """Retrieve a single report by internal UUID with least-privilege column selection.
 
-        if r is None:
+        Strictly selects only fields required by ModeratorReportResponse.
+        """
+        stmt = sa.select(
+            Report.id,
+            Report.category,
+            Report.description,
+            Report.evidence_url,
+            Report.status,
+            Report.created_at,
+            Report.updated_at,
+        ).where(Report.id == report_id)
+        result = await db.execute(stmt)
+        row = result.one_or_none()
+
+        if row is None:
             return None
 
         return ModeratorReportResponse(
-            id=r.id,
-            category=r.category,
-            description=r.description,
-            evidence_url=r.evidence_url,
-            status=r.status,
-            created_at=r.created_at,
-            updated_at=r.updated_at,
+            id=row.id,
+            category=row.category,
+            description=row.description,
+            evidence_url=row.evidence_url,
+            status=row.status,
+            created_at=row.created_at,
+            updated_at=row.updated_at,
         )
 
 
