@@ -26,7 +26,7 @@ whistledrop/
 │   ├── core/
 │   │   ├── __init__.py
 │   │   ├── config.py         # Type-safe settings, secret validation, environment logic
-│   │   └── security.py       # CSPRNG case-code generator & HMAC digest derivation
+│   │   └── security.py       # Argon2id password hashing, JWT tokens, CSPRNG case-codes
 │   ├── db/
 │   │   ├── __init__.py
 │   │   └── session.py        # Async engine, sessionmaker, and get_db dependency
@@ -40,22 +40,27 @@ whistledrop/
 │   │   └── audit_log.py      # Action audit logs
 │   ├── schemas/
 │   │   ├── __init__.py       # Pydantic schemas export
+│   │   ├── auth.py           # Moderator login and token schemas
 │   │   └── report.py         # Public request and response schemas
 │   ├── services/
 │   │   ├── __init__.py       # Services export
+│   │   ├── auth_service.py   # Moderator authentication, hashing, and token issuance
 │   │   └── report_service.py # Core business logic for report submission and tracking
 │   └── api/
 │       ├── __init__.py
+│       ├── deps.py           # Authentication & role-based authorization dependencies
 │       └── v1/
 │           ├── __init__.py
 │           ├── api.py        # API router aggregator
 │           └── endpoints/
 │               ├── __init__.py
+│               ├── auth.py   # Moderator authentication & authorization test routes
 │               ├── health.py # Health check probe endpoint
 │               └── reports.py# Anonymous report submission & tracking endpoints
 └── tests/
     ├── __init__.py
     ├── conftest.py           # Test database fixtures, isolation, and async session setup
+    ├── test_auth.py          # Argon2id, JWT lifecycle, RBAC, and login tests
     ├── test_config.py        # Configuration, CORS, and secret validation tests
     ├── test_database.py      # Database models, constraints, enums, and schema tests
     ├── test_health.py        # Health and root endpoint tests
@@ -96,7 +101,23 @@ Security controls are implemented with defense-in-depth:
 2. **Impact of Secret Compromise:**
    - **`JWT_SECRET` compromise:** An attacker could forge moderator authorization tokens and impersonate moderators.
    - **`CASE_CODE_SECRET` compromise:** An attacker cannot "decrypt" stored one-way case-code digests (as cryptographic digests are inherently non-reversible), but an attacker with database read access could perform offline dictionary or brute-force precomputation attacks against suspected candidate case codes.
-3. **Internal ID Concealment & Public Data Minimization:**
+3. **Authentication vs. Anonymous Reporting Boundary:**
+   - *Whistleblowers:* Never register, provide credentials, or establish sessions. Access to case tracking is authenticated purely via bearer case-code possession.
+   - *Moderators / Admins:* Internal personnel undergo credential authentication (`POST /api/v1/auth/login`) to receive short-lived bearer JWTs for role-gated administration.
+4. **Moderator Password Hashing & Canonicalization:**
+   - Password hashing uses **Argon2id** (`argon2-cffi`) configured with OWASP-recommended parameters: `time_cost=3`, `memory_cost=65536` (64 MiB), `parallelism=4`, `hash_len=32`, and `salt_len=16`.
+   - Usernames are canonicalized (stripped and converted to lowercase) upon creation and login to prevent homograph, casing, and whitespace collision bypasses.
+   - Failed authentication yields a uniform `401 Unauthorized` (`"Incorrect username or password"`) without revealing whether the username exists or the password was incorrect.
+5. **Short-Lived JWT Bearer Tokens:**
+   - Issued upon successful moderator authentication with a 30-minute expiration (`ACCESS_TOKEN_EXPIRE_MINUTES=30`).
+   - Signed using `HS256` with `JWT_SECRET`. Algorithm confusion is strictly prevented by specifying the allowed algorithm list during token decoding.
+   - Payload contains standard claims: `sub` (moderator UUID), `role` (`MODERATOR` or `ADMIN`), `iat` (issued-at timestamp), and `exp` (expiration timestamp).
+   - Plaintext passwords, password hashes, and secrets are strictly excluded from JWT claims, logs, and API responses.
+6. **Role-Based Access Control (RBAC):**
+   - Tiered authorization dependencies enforce least privilege:
+     - `require_moderator`: Permits authorized `MODERATOR` and `ADMIN` personnel to perform triage operations.
+     - `require_admin`: Strictly limits privileged configurations and admin actions to `ADMIN` accounts.
+7. **Internal ID Concealment & Public Data Minimization:**
    - Internal database primary keys (UUIDs) remain strictly internal and are never exposed in public endpoints.
    - Public report ingestion response schema (`POST /api/v1/reports`):
      ```json
@@ -119,16 +140,16 @@ Security controls are implemented with defense-in-depth:
      }
      ```
      *Strict Omission:* Internal UUIDs, case_code_digest, description, evidence_url, audit logs, and moderator identities are completely excluded from public tracking.
-4. **Metadata-Only Evidence Handling:**
+8. **Metadata-Only Evidence Handling:**
    - Submitted `evidence_url` values are strictly validated via structured URL parsers and stored purely as text metadata. The server never makes outbound HTTP requests or fetches submitted URLs, eliminating Server-Side Request Forgery (SSRF) risks.
-5. **Production-Hardened Defaults:**
+9. **Production-Hardened Defaults:**
    - `DEBUG` is strictly enforced to `False` in production environments.
    - OpenAPI documentation endpoints (`/docs`, `/redoc`, `/openapi.json`) are disabled when `DEBUG=False` to prevent API schema reconnaissance.
    - Minimum entropy requirements (min 32 characters) and placeholder rejection are enforced for production secrets at application startup.
-6. **Restrictive CORS:**
-   - Permissive wildcard origins (`allow_origins=["*"]`) are prohibited.
-   - `allow_credentials` is set to `False` by default because authentication uses `Authorization: Bearer <token>` headers rather than browser cookies.
-   - In production, CORS defaults to an empty allowlist (enforcing strict browser Same-Origin Policy) unless explicit origins are configured.
+10. **Restrictive CORS:**
+    - Permissive wildcard origins (`allow_origins=["*"]`) are prohibited.
+    - `allow_credentials` is set to `False` by default because authentication uses `Authorization: Bearer <token>` headers rather than browser cookies.
+    - In production, CORS defaults to an empty allowlist (enforcing strict browser Same-Origin Policy) unless explicit origins are configured.
 
 ---
 
@@ -140,7 +161,7 @@ Security controls are implemented with defense-in-depth:
 | **Traffic Correlation / Metadata Leakage** | Correlating report submissions with network traffic or server logs. | Application models and application logs omit submitter identity and network metadata; infrastructure ingress proxies must be configured to discard or anonymize access logs. |
 | **Cross-Domain Secret Compromise** | Compromise of moderator JWT secrets impacting report access. | Cryptographic secret separation; `JWT_SECRET` and `CASE_CODE_SECRET` are independent keys validated to never share values. |
 | **API Schema Reconnaissance** | Attackers scanning interactive API documentation to map out endpoints and attack vectors. | Automatic suppression of Swagger UI (`/docs`), ReDoc (`/redoc`), and OpenAPI schema (`/openapi.json`) when `DEBUG=False` in production. |
-| **Unauthorized Moderator Access** | Malicious actors accessing case management records. | Role-Based Access Control (RBAC), short-lived JWTs, and structured audit logs for all moderator actions. |
+| **Unauthorized Moderator Access** | Malicious actors accessing case management records. | Argon2id password hashing, canonical username normalization, Role-Based Access Control (RBAC), short-lived JWTs, and structured audit logs for all moderator actions. |
 
 ---
 
@@ -151,9 +172,10 @@ Security controls are implemented with defense-in-depth:
 - [x] **Phase 1:** Async Database Foundation (PostgreSQL, SQLAlchemy 2.0 Async, Enums, Models, Alembic Migrations)
 - [x] **Phase 2:** Secure Anonymous Report Ingestion & Cryptographic Case-Code Generation
 - [x] **Phase 3:** Public Anonymous Case Tracking & Status Updates
-- [ ] **Phase 4 (Planned):** Moderator Authentication & Role-Based Access Control (RBAC)
+- [x] **Phase 4:** Moderator Authentication & Role-Based Access Control (RBAC)
 - [ ] **Phase 5 (Planned):** Case Status Lifecycle Management & Immutable Audit Trail
 - [ ] **Phase 6 (Planned):** Evidence Attachment Storage & Advanced Defense (Rate Limiting, ClamAV Scanning)
+
 
 ---
 

@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     # Distinct Cryptographic Secrets
     JWT_SECRET: str = DEV_INSECURE_JWT_SECRET
     CASE_CODE_SECRET: str = DEV_INSECURE_CASE_CODE_SECRET
+    JWT_ALGORITHM: str = "HS256"
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
 
     # Configurable CORS Origins
     BACKEND_CORS_ORIGINS: Union[List[str], str] = []
