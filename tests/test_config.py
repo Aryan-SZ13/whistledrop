@@ -115,3 +115,54 @@ def test_production_valid_defaults():
     # Restrictive CORS: empty by default in production unless explicitly set
     assert cfg.BACKEND_CORS_ORIGINS == []
 
+
+@pytest.mark.parametrize(
+    "field,invalid_val",
+    [
+        ("SUBMISSION_RATE_LIMIT", 0),
+        ("SUBMISSION_RATE_LIMIT", -1),
+        ("SUBMISSION_RATE_WINDOW_SECONDS", 0),
+        ("SUBMISSION_RATE_WINDOW_SECONDS", -10),
+        ("LOOKUP_RATE_LIMIT", 0),
+        ("LOOKUP_RATE_LIMIT", -5),
+        ("LOOKUP_RATE_WINDOW_SECONDS", 0),
+        ("LOOKUP_RATE_WINDOW_SECONDS", -60),
+        ("LOOKUP_GLOBAL_RATE_LIMIT", 0),
+        ("LOOKUP_GLOBAL_RATE_LIMIT", -100),
+        ("LOOKUP_GLOBAL_RATE_WINDOW_SECONDS", 0),
+        ("LOOKUP_GLOBAL_RATE_WINDOW_SECONDS", -30),
+        ("LOGIN_RATE_LIMIT", 0),
+        ("LOGIN_RATE_LIMIT", -1),
+        ("LOGIN_RATE_WINDOW_SECONDS", 0),
+        ("LOGIN_RATE_WINDOW_SECONDS", -300),
+    ],
+)
+def test_rate_limit_bounds_rejected(field: str, invalid_val: int):
+    """Verify that zero or negative values for rate limit fields are rejected."""
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(**{field: invalid_val})
+    assert "at least 1" in str(exc_info.value)
+
+
+def test_rate_limit_valid_bounds_accepted():
+    """Verify that positive values (>= 1) for all rate limit fields are accepted."""
+    cfg = Settings(
+        SUBMISSION_RATE_LIMIT=1,
+        SUBMISSION_RATE_WINDOW_SECONDS=1,
+        LOOKUP_RATE_LIMIT=1,
+        LOOKUP_RATE_WINDOW_SECONDS=1,
+        LOOKUP_GLOBAL_RATE_LIMIT=1,
+        LOOKUP_GLOBAL_RATE_WINDOW_SECONDS=1,
+        LOGIN_RATE_LIMIT=1,
+        LOGIN_RATE_WINDOW_SECONDS=1,
+    )
+    assert cfg.SUBMISSION_RATE_LIMIT == 1
+    assert cfg.SUBMISSION_RATE_WINDOW_SECONDS == 1
+    assert cfg.LOOKUP_RATE_LIMIT == 1
+    assert cfg.LOOKUP_RATE_WINDOW_SECONDS == 1
+    assert cfg.LOOKUP_GLOBAL_RATE_LIMIT == 1
+    assert cfg.LOOKUP_GLOBAL_RATE_WINDOW_SECONDS == 1
+    assert cfg.LOGIN_RATE_LIMIT == 1
+    assert cfg.LOGIN_RATE_WINDOW_SECONDS == 1
+
+

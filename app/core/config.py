@@ -91,6 +91,23 @@ class Settings(BaseSettings):
             return [str(origin).strip() for origin in v if str(origin).strip()]
         return []
 
+    @field_validator(
+        "SUBMISSION_RATE_LIMIT",
+        "SUBMISSION_RATE_WINDOW_SECONDS",
+        "LOOKUP_RATE_LIMIT",
+        "LOOKUP_RATE_WINDOW_SECONDS",
+        "LOOKUP_GLOBAL_RATE_LIMIT",
+        "LOOKUP_GLOBAL_RATE_WINDOW_SECONDS",
+        "LOGIN_RATE_LIMIT",
+        "LOGIN_RATE_WINDOW_SECONDS",
+    )
+    @classmethod
+    def validate_rate_limit_bounds(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("Rate limit requests and window durations must be at least 1.")
+        return v
+
+
     @model_validator(mode="after")
     def validate_environment_and_secrets(self) -> "Settings":
         env_normalized = self.ENV.strip().lower()
