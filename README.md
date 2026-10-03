@@ -109,7 +109,7 @@ Security controls are implemented with defense-in-depth:
 - [x] **Phase 0:** Backend Foundation, Configuration & Health Check
 - [x] **Phase 0.5:** Security Hardening (Cryptographic Secret Separation, Environment-Aware Debug, Restrictive CORS, Async DB Standardization)
 - [x] **Phase 1:** Async Database Foundation (PostgreSQL, SQLAlchemy 2.0 Async, Enums, Models, Alembic Migrations)
-- [ ] **Phase 2 (Planned):** Secure Report Ingestion & Cryptographic Case-Code Generation
+- [x] **Phase 2:** Secure Anonymous Report Ingestion & Cryptographic Case-Code Generation
 - [ ] **Phase 3 (Planned):** Case Tracking & Moderator Status Updates
 - [ ] **Phase 4 (Planned):** Moderator Authentication & Role-Based Access Control (RBAC)
 - [ ] **Phase 5 (Planned):** Case Status Lifecycle Management & Immutable Audit Trail

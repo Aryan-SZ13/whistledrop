@@ -1,9 +1,14 @@
 from typing import AsyncGenerator
+import pytest
 import pytest_asyncio
-from sqlalchemy.pool import NullPool
+import sqlalchemy as sa
+from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from app.core.config import settings
+from app.db.session import get_db
+from app.main import app
 
 # Test engine with NullPool to prevent event-loop cross-contamination between test cases
 test_engine = create_async_engine(
@@ -20,14 +25,44 @@ TestAsyncSession = async_sessionmaker(
 )
 
 
+@pytest_asyncio.fixture(autouse=True)
+async def clean_database():
+    """Ensure complete database table isolation before and after every test."""
+    async with test_engine.begin() as conn:
+        await conn.execute(
+            sa.text("TRUNCATE reports, moderators, report_updates, audit_logs CASCADE")
+        )
+    yield
+    async with test_engine.begin() as conn:
+        await conn.execute(
+            sa.text("TRUNCATE reports, moderators, report_updates, audit_logs CASCADE")
+        )
+
+
 @pytest_asyncio.fixture
 async def db_session() -> AsyncGenerator[AsyncSession, None]:
-    """Provides a transactional database session for tests, rolling back after completion."""
-    async with test_engine.connect() as connection:
-        transaction = await connection.begin()
-        session = AsyncSession(bind=connection, expire_on_commit=False)
+    """Provides an isolated database session that supports explicit commits."""
+    async with TestAsyncSession() as session:
         try:
             yield session
         finally:
             await session.close()
-            await transaction.rollback()
+
+
+@pytest.fixture
+def client() -> TestClient:
+    """TestClient configured with dependency overrides for database sessions."""
+    async def override_get_db() -> AsyncGenerator[AsyncSession, None]:
+        async with TestAsyncSession() as session:
+            try:
+                yield session
+            except Exception:
+                await session.rollback()
+                raise
+            finally:
+                await session.close()
+
+    app.dependency_overrides[get_db] = override_get_db
+    with TestClient(app) as test_client:
+        yield test_client
+    app.dependency_overrides.clear()
