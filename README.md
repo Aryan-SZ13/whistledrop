@@ -25,7 +25,8 @@ whistledrop/
 │   ├── main.py               # FastAPI entrypoint, middleware, and route mounting
 │   ├── core/
 │   │   ├── __init__.py
-│   │   └── config.py         # Type-safe settings, secret validation, environment logic
+│   │   ├── config.py         # Type-safe settings, secret validation, environment logic
+│   │   └── security.py       # CSPRNG case-code generator & HMAC digest derivation
 │   ├── db/
 │   │   ├── __init__.py
 │   │   └── session.py        # Async engine, sessionmaker, and get_db dependency
@@ -37,6 +38,12 @@ whistledrop/
 │   │   ├── report.py         # Core whistleblower report schema
 │   │   ├── report_update.py  # Moderator case status updates
 │   │   └── audit_log.py      # Action audit logs
+│   ├── schemas/
+│   │   ├── __init__.py       # Pydantic schemas export
+│   │   └── report.py         # Public request and response schemas
+│   ├── services/
+│   │   ├── __init__.py       # Services export
+│   │   └── report_service.py # Core business logic for report submission and tracking
 │   └── api/
 │       ├── __init__.py
 │       └── v1/
@@ -44,13 +51,16 @@ whistledrop/
 │           ├── api.py        # API router aggregator
 │           └── endpoints/
 │               ├── __init__.py
-│               └── health.py # Health check probe endpoint
+│               ├── health.py # Health check probe endpoint
+│               └── reports.py# Anonymous report submission & tracking endpoints
 └── tests/
     ├── __init__.py
-    ├── conftest.py           # Test database fixtures and async session setup
+    ├── conftest.py           # Test database fixtures, isolation, and async session setup
     ├── test_config.py        # Configuration, CORS, and secret validation tests
     ├── test_database.py      # Database models, constraints, enums, and schema tests
-    └── test_health.py        # Health and root endpoint tests
+    ├── test_health.py        # Health and root endpoint tests
+    ├── test_reports.py       # Report creation, validation, and crypto regression tests
+    └── test_tracking.py      # Public case tracking, isolation, and minimization tests
 ```
 
 - **Framework:** FastAPI utilizing ASGI for high-concurrency asynchronous I/O.
@@ -86,9 +96,9 @@ Security controls are implemented with defense-in-depth:
 2. **Impact of Secret Compromise:**
    - **`JWT_SECRET` compromise:** An attacker could forge moderator authorization tokens and impersonate moderators.
    - **`CASE_CODE_SECRET` compromise:** An attacker cannot "decrypt" stored one-way case-code digests (as cryptographic digests are inherently non-reversible), but an attacker with database read access could perform offline dictionary or brute-force precomputation attacks against suspected candidate case codes.
-3. **Internal ID Concealment:**
-   - Internal database primary keys (UUIDs) remain strictly internal and are never exposed in public report submission responses.
-   - Public report ingestion response schema exposes only:
+3. **Internal ID Concealment & Public Data Minimization:**
+   - Internal database primary keys (UUIDs) remain strictly internal and are never exposed in public endpoints.
+   - Public report ingestion response schema (`POST /api/v1/reports`):
      ```json
      {
        "case_code": "wdc_...",
@@ -96,6 +106,19 @@ Security controls are implemented with defense-in-depth:
        "created_at": "2026-10-03T16:20:00Z"
      }
      ```
+   - Public report tracking response schema (`GET /api/v1/reports/{case_code}`):
+     ```json
+     {
+       "status": "UNDER_REVIEW",
+       "updates": [
+         {
+           "message": "Initial assessment opened by security team.",
+           "created_at": "2026-10-03T16:30:00Z"
+         }
+       ]
+     }
+     ```
+     *Strict Omission:* Internal UUIDs, case_code_digest, description, evidence_url, audit logs, and moderator identities are completely excluded from public tracking.
 4. **Metadata-Only Evidence Handling:**
    - Submitted `evidence_url` values are strictly validated via structured URL parsers and stored purely as text metadata. The server never makes outbound HTTP requests or fetches submitted URLs, eliminating Server-Side Request Forgery (SSRF) risks.
 5. **Production-Hardened Defaults:**
@@ -127,7 +150,7 @@ Security controls are implemented with defense-in-depth:
 - [x] **Phase 0.5:** Security Hardening (Cryptographic Secret Separation, Environment-Aware Debug, Restrictive CORS, Async DB Standardization)
 - [x] **Phase 1:** Async Database Foundation (PostgreSQL, SQLAlchemy 2.0 Async, Enums, Models, Alembic Migrations)
 - [x] **Phase 2:** Secure Anonymous Report Ingestion & Cryptographic Case-Code Generation
-- [ ] **Phase 3 (Planned):** Case Tracking & Moderator Status Updates
+- [x] **Phase 3:** Public Anonymous Case Tracking & Status Updates
 - [ ] **Phase 4 (Planned):** Moderator Authentication & Role-Based Access Control (RBAC)
 - [ ] **Phase 5 (Planned):** Case Status Lifecycle Management & Immutable Audit Trail
 - [ ] **Phase 6 (Planned):** Evidence Attachment Storage & Advanced Defense (Rate Limiting, ClamAV Scanning)

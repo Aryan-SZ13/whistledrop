@@ -1,12 +1,18 @@
 import logging
-from typing import Tuple
+from typing import Optional, Tuple
+import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import derive_case_code_digest, generate_case_code
 from app.models.audit_log import AuditLog
 from app.models.enums import ReportStatus
 from app.models.report import Report
-from app.schemas.report import ReportCreate
+from app.models.report_update import ReportUpdate
+from app.schemas.report import (
+    ReportCreate,
+    ReportTrackingResponse,
+    ReportUpdatePublic,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +33,7 @@ class ReportService:
         3. Persist the Report model record with status SUBMITTED (storing only digest).
         4. Persist an AuditLog record (excluding case code, description, and client metadata).
         5. Atomically commit the transaction.
-        6. Return the persisted Report model and the single-use plaintext case code.
+        6. Return the persisted Report model and the reusable plaintext case code.
 
         Returns:
             Tuple[Report, str]: The persisted report model and the plaintext case code.
@@ -77,6 +83,65 @@ class ReportService:
             await db.rollback()
             logger.error("Failed to submit anonymous report, transaction rolled back: %s", str(e))
             raise
+
+    async def get_report_tracking(
+        self,
+        db: AsyncSession,
+        case_code: str,
+    ) -> Optional[ReportTrackingResponse]:
+        """Retrieve the public tracking state of a report by its case code.
+
+        Flow:
+        1. Normalize case code by stripping whitespace.
+        2. Derive HMAC-SHA256 digest using CASE_CODE_SECRET.
+        3. Perform indexed lookup on reports.case_code_digest.
+        4. If found, retrieve chronological public updates without moderator/audit details.
+        5. Map to public ReportTrackingResponse schema with strict field minimization.
+
+        Returns:
+            Optional[ReportTrackingResponse]: Public tracking schema if found, None otherwise.
+        """
+        if not case_code:
+            return None
+
+        # 1. Normalize case code where intended
+        normalized_code = case_code.strip()
+        if not normalized_code:
+            return None
+
+        # 2. Derive HMAC digest using centralized security function
+        case_code_digest = derive_case_code_digest(normalized_code)
+
+        # 3. Query report by indexed digest
+        stmt = sa.select(Report).where(Report.case_code_digest == case_code_digest)
+        result = await db.execute(stmt)
+        report = result.scalar_one_or_none()
+
+        if report is None:
+            return None
+
+        # 4. Query chronological updates specifically (avoids loading audit_logs or moderators)
+        stmt_updates = (
+            sa.select(ReportUpdate)
+            .where(ReportUpdate.report_id == report.id)
+            .order_by(ReportUpdate.created_at.asc())
+        )
+        res_updates = await db.execute(stmt_updates)
+        updates = res_updates.scalars().all()
+
+        # 5. Construct public tracking response with strict field minimization
+        public_updates = [
+            ReportUpdatePublic(
+                message=u.message,
+                created_at=u.created_at,
+            )
+            for u in updates
+        ]
+
+        return ReportTrackingResponse(
+            status=report.status,
+            updates=public_updates,
+        )
 
 
 report_service = ReportService()
