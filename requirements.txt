@@ -22,5 +22,5 @@ pytest==9.1.1
 pytest-asyncio==1.4.0
 
 # Rate Limiting & Abuse Resistance (Async Redis Client)
-redis[hiredis]>=5.0.0
+redis[hiredis]==8.1.0
 

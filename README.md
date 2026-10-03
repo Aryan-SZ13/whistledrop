@@ -205,7 +205,7 @@ WhistleDrop enforces an abuse-resistance layer backed by Redis 7 and atomic Lua 
 | :--- | :--- | :--- |
 | **Purpose** | Persistent business data: reports, audit logs, accounts | Ephemeral abuse-control counters and windows |
 | **Retention** | Long-term durable storage | Bounded TTLs (60 to 300 seconds) |
-| **Client Identity** | NEVER persisted (no IP, User-Agent, or fingerprint columns) | Stored ONLY as 16-hex keyed HMAC-SHA256 buckets |
+| **Client Identity** | NEVER persisted (no IP, User-Agent, or fingerprint columns) | Stored ONLY as full keyed HMAC-SHA256 digest buckets |
 | **Failure Mode** | Transactional ACID rollback | Fail-closed (HTTP 503) on Redis outage |
 
 ### 2. Endpoint Policies & Defaults
@@ -222,8 +222,8 @@ All thresholds and window durations are configurable via environment variables (
 ### 3. Client-Bucket Privacy Model
 
 To prevent exposing raw IP addresses or creating rainbow-table-reversible hashes in Redis:
-- Client identifiers are derived using **keyed HMAC-SHA256**:
-  $$\text{bucket} = \text{HMAC-SHA256}(\text{RATE\_LIMIT\_KEY\_SECRET}, \text{canonical\_client\_ip})[:16]$$
+- Client identifiers are derived using **keyed HMAC-SHA256** (full 64-hexadecimal-character digest):
+  $$\text{bucket} = \text{HMAC-SHA256}(\text{RATE\_LIMIT\_KEY\_SECRET}, \text{canonical\_client\_ip})$$
 - `RATE_LIMIT_KEY_SECRET` is a dedicated 256-bit secret, strictly separated from `JWT_SECRET` and `CASE_CODE_SECRET`.
 - Plaintext IP addresses, case codes, usernames, passwords, JWTs, and report bodies are **never placed in Redis keys or values**.
 - Rotating `RATE_LIMIT_KEY_SECRET` immediately invalidates all existing client buckets across the cluster.

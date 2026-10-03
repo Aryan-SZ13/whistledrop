@@ -123,14 +123,14 @@ class RateLimiterService:
 
         Uses dedicated RATE_LIMIT_KEY_SECRET exclusively.
         The client IP is never stored in Redis keys in plaintext.
-        Truncated to 16 hex characters.
+        Full 64-hexadecimal-character HMAC-SHA256 digest.
         """
         canonical = client_ip.strip()
         return hmac.new(
             settings.RATE_LIMIT_KEY_SECRET.encode("utf-8"),
             canonical.encode("utf-8"),
             hashlib.sha256,
-        ).hexdigest()[:16]
+        ).hexdigest()
 
     def build_key(self, policy_prefix: str, bucket_identifier: str) -> str:
         """Format a policy-versioned Redis key."""
@@ -152,26 +152,27 @@ class RateLimiterService:
     ) -> RateLimitResult:
         redis_client = get_redis()
         try:
-            if not self._single_script_sha:
+            try:
+                if not self._single_script_sha:
+                    self._single_script_sha = await redis_client.script_load(SINGLE_POLICY_LUA_SCRIPT)
+                res = await redis_client.evalsha(
+                    self._single_script_sha,
+                    1,
+                    key,
+                    window,
+                    limit,
+                    request_id,
+                )
+            except redis_exceptions.NoScriptError:
                 self._single_script_sha = await redis_client.script_load(SINGLE_POLICY_LUA_SCRIPT)
-            res = await redis_client.evalsha(
-                self._single_script_sha,
-                1,
-                key,
-                window,
-                limit,
-                request_id,
-            )
-        except redis_exceptions.NoScriptError:
-            self._single_script_sha = await redis_client.script_load(SINGLE_POLICY_LUA_SCRIPT)
-            res = await redis_client.evalsha(
-                self._single_script_sha,
-                1,
-                key,
-                window,
-                limit,
-                request_id,
-            )
+                res = await redis_client.evalsha(
+                    self._single_script_sha,
+                    1,
+                    key,
+                    window,
+                    limit,
+                    request_id,
+                )
         except redis_exceptions.RedisError as e:
             logger.error("Rate limiting service failure: %s", type(e).__name__)
             raise RateLimitUnavailableError("Rate limiting service unavailable") from e
@@ -192,32 +193,33 @@ class RateLimiterService:
     ) -> RateLimitResult:
         redis_client = get_redis()
         try:
-            if not self._multi_script_sha:
+            try:
+                if not self._multi_script_sha:
+                    self._multi_script_sha = await redis_client.script_load(MULTI_POLICY_LUA_SCRIPT)
+                res = await redis_client.evalsha(
+                    self._multi_script_sha,
+                    2,
+                    client_key,
+                    global_key,
+                    client_window,
+                    client_limit,
+                    global_window,
+                    global_limit,
+                    request_id,
+                )
+            except redis_exceptions.NoScriptError:
                 self._multi_script_sha = await redis_client.script_load(MULTI_POLICY_LUA_SCRIPT)
-            res = await redis_client.evalsha(
-                self._multi_script_sha,
-                2,
-                client_key,
-                global_key,
-                client_window,
-                client_limit,
-                global_window,
-                global_limit,
-                request_id,
-            )
-        except redis_exceptions.NoScriptError:
-            self._multi_script_sha = await redis_client.script_load(MULTI_POLICY_LUA_SCRIPT)
-            res = await redis_client.evalsha(
-                self._multi_script_sha,
-                2,
-                client_key,
-                global_key,
-                client_window,
-                client_limit,
-                global_window,
-                global_limit,
-                request_id,
-            )
+                res = await redis_client.evalsha(
+                    self._multi_script_sha,
+                    2,
+                    client_key,
+                    global_key,
+                    client_window,
+                    client_limit,
+                    global_window,
+                    global_limit,
+                    request_id,
+                )
         except redis_exceptions.RedisError as e:
             logger.error("Rate limiting service failure: %s", type(e).__name__)
             raise RateLimitUnavailableError("Rate limiting service unavailable") from e

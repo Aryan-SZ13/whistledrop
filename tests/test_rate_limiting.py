@@ -144,9 +144,15 @@ async def test_limiter_policy_versioned_key_format():
     assert key_str.startswith("rl:v1:submit:")
 
     bucket = key_str.split(":")[-1]
-    # Bucket must be 16-hex characters
-    assert len(bucket) == 16
+    # Bucket must be full 64-hexadecimal character HMAC-SHA256 digest
+    assert len(bucket) == 64
     assert all(c in "0123456789abcdef" for c in bucket)
+    expected_digest = hmac.new(
+        settings.RATE_LIMIT_KEY_SECRET.encode("utf-8"),
+        ip.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    assert bucket == expected_digest
     # Plaintext IP must NEVER be in key
     assert ip not in key_str
 
@@ -495,3 +501,132 @@ def test_ip_canonicalization():
     # IPv6 normalization (compressed representation)
     assert canonicalize_ip("2001:0db8:0000:0000:0000:0000:0000:0001") == "2001:db8::1"
     assert canonicalize_ip("::1") == "::1"
+
+
+# ==============================================================================
+# 8. Redis NoScript Recovery Fail-Closed Tests
+# ==============================================================================
+
+@pytest.mark.asyncio
+async def test_noscript_recovery_script_load_failure_direct_service():
+    """Verify NoScriptError recovery fails closed if script_load raises RedisError."""
+    fake_redis = AsyncMock()
+    fake_redis.evalsha.side_effect = redis_exceptions.NoScriptError("NOSCRIPT No matching script")
+    fake_redis.script_load.side_effect = redis_exceptions.ConnectionError("Redis connection lost")
+
+    with patch("app.services.rate_limiter.get_redis", return_value=fake_redis):
+        # Reset cached SHAs to trigger recovery path
+        rate_limiter._single_script_sha = "stale_sha"
+        policy = RateLimitPolicy(key_prefix="test_noscript", max_requests=5, window_seconds=60)
+        with pytest.raises(RateLimitUnavailableError) as exc_info:
+            await rate_limiter.check_rate_limit(policy, "192.168.1.200")
+        assert "Rate limiting service unavailable" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_noscript_recovery_second_evalsha_failure_direct_service():
+    """Verify NoScriptError recovery fails closed if second evalsha raises RedisError."""
+    fake_redis = AsyncMock()
+    fake_redis.evalsha.side_effect = [
+        redis_exceptions.NoScriptError("NOSCRIPT No matching script"),
+        redis_exceptions.TimeoutError("Redis timeout on reload"),
+    ]
+    fake_redis.script_load.return_value = "new_valid_sha"
+
+    with patch("app.services.rate_limiter.get_redis", return_value=fake_redis):
+        rate_limiter._single_script_sha = "stale_sha"
+        policy = RateLimitPolicy(key_prefix="test_noscript", max_requests=5, window_seconds=60)
+        with pytest.raises(RateLimitUnavailableError) as exc_info:
+            await rate_limiter.check_rate_limit(policy, "192.168.1.201")
+        assert "Rate limiting service unavailable" in str(exc_info.value)
+
+
+def test_noscript_recovery_script_load_failure_fails_closed_single_policy(client: TestClient):
+    """Verify endpoint returns HTTP 503 without error leakage when script_load fails during NoScript recovery."""
+    fake_redis = AsyncMock()
+    fake_redis.evalsha.side_effect = redis_exceptions.NoScriptError("NOSCRIPT")
+    fake_redis.script_load.side_effect = redis_exceptions.ConnectionError("Redis connection dropped")
+
+    with patch("app.services.rate_limiter.get_redis", return_value=fake_redis):
+        rate_limiter._single_script_sha = "stale_sha"
+        res = client.post(
+            "/api/v1/reports",
+            json={"category": "CORRUPTION", "description": "Recovery path test description."},
+        )
+        assert res.status_code == 503
+        assert res.json() == {"detail": "Rate limiting service unavailable"}
+        assert "redis" not in res.text.lower()
+        assert "connection" not in res.text.lower()
+
+
+def test_noscript_recovery_second_evalsha_failure_fails_closed_single_policy(client: TestClient):
+    """Verify endpoint returns HTTP 503 when second evalsha fails during NoScript recovery."""
+    fake_redis = AsyncMock()
+    fake_redis.evalsha.side_effect = [
+        redis_exceptions.NoScriptError("NOSCRIPT"),
+        redis_exceptions.TimeoutError("Timed out executing reloaded script"),
+    ]
+    fake_redis.script_load.return_value = "new_valid_sha"
+
+    with patch("app.services.rate_limiter.get_redis", return_value=fake_redis):
+        rate_limiter._single_script_sha = "stale_sha"
+        res = client.post(
+            "/api/v1/reports",
+            json={"category": "CORRUPTION", "description": "Recovery path test description."},
+        )
+        assert res.status_code == 503
+        assert res.json() == {"detail": "Rate limiting service unavailable"}
+        assert "redis" not in res.text.lower()
+        assert "timed out" not in res.text.lower()
+
+
+def test_noscript_recovery_script_load_failure_fails_closed_multi_policy(client: TestClient):
+    """Verify lookup endpoint returns HTTP 503 when script_load fails during multi-policy NoScript recovery."""
+    fake_redis = AsyncMock()
+    fake_redis.evalsha.side_effect = redis_exceptions.NoScriptError("NOSCRIPT")
+    fake_redis.script_load.side_effect = redis_exceptions.ConnectionError("Redis connection dropped")
+
+    with patch("app.services.rate_limiter.get_redis", return_value=fake_redis):
+        rate_limiter._multi_script_sha = "stale_multi_sha"
+        res = client.get("/api/v1/reports/wdc_sample_case_code_for_noscript_123")
+        assert res.status_code == 503
+        assert res.json() == {"detail": "Rate limiting service unavailable"}
+        assert "redis" not in res.text.lower()
+        assert "connection" not in res.text.lower()
+
+
+def test_noscript_recovery_second_evalsha_failure_fails_closed_multi_policy(client: TestClient):
+    """Verify lookup endpoint returns HTTP 503 when second evalsha fails during multi-policy NoScript recovery."""
+    fake_redis = AsyncMock()
+    fake_redis.evalsha.side_effect = [
+        redis_exceptions.NoScriptError("NOSCRIPT"),
+        redis_exceptions.TimeoutError("Timed out executing reloaded script"),
+    ]
+    fake_redis.script_load.return_value = "new_valid_multi_sha"
+
+    with patch("app.services.rate_limiter.get_redis", return_value=fake_redis):
+        rate_limiter._multi_script_sha = "stale_multi_sha"
+        res = client.get("/api/v1/reports/wdc_sample_case_code_for_noscript_123")
+        assert res.status_code == 503
+        assert res.json() == {"detail": "Rate limiting service unavailable"}
+        assert "redis" not in res.text.lower()
+        assert "timed out" not in res.text.lower()
+
+
+def test_noscript_recovery_failure_fails_closed_on_login(client: TestClient):
+    """Verify login endpoint returns HTTP 503 when Redis fails during NoScript recovery."""
+    fake_redis = AsyncMock()
+    fake_redis.evalsha.side_effect = redis_exceptions.NoScriptError("NOSCRIPT")
+    fake_redis.script_load.side_effect = redis_exceptions.ConnectionError("Redis connection dropped")
+
+    with patch("app.services.rate_limiter.get_redis", return_value=fake_redis):
+        rate_limiter._single_script_sha = "stale_sha"
+        res = client.post(
+            "/api/v1/auth/login",
+            json={"username": "admin", "password": "AnyPassword123!"},
+        )
+        assert res.status_code == 503
+        assert res.json() == {"detail": "Rate limiting service unavailable"}
+        assert "redis" not in res.text.lower()
+        assert "connection" not in res.text.lower()
+
