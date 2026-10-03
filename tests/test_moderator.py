@@ -4,10 +4,11 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import create_access_token
-from app.models.enums import ModeratorRole, ReportCategory, ReportStatus
+from app.models.enums import ModeratorRole, ReportCategory, ReportStatus, ReportUpdateType
 from app.models.report import Report
 from app.schemas.report import ReportCreate
 from app.services.auth_service import auth_service
+from app.services.moderator_service import moderator_service
 from app.services.report_service import report_service
 
 
@@ -797,5 +798,117 @@ async def test_moderator_update_validation(client, db_session: AsyncSession):
     )
     assert res_unknown.status_code == 404
     assert res_unknown.json()["detail"] == "Report not found"
+
+
+@pytest.mark.asyncio
+async def test_moderator_detail_updates_query_column_least_privilege(db_session: AsyncSession):
+    """Verify moderator detail query selects only the 5 intended ReportUpdate columns without ORM hydration."""
+    from app.services.moderator_service import moderator_service
+
+    # Create report and moderator
+    r, _ = await report_service.create_report(
+        db_session,
+        ReportCreate(category=ReportCategory.TECHNICAL, description="Technical detail updates query test"),
+    )
+    mod = await auth_service.create_moderator(
+        db_session,
+        username="detail_query_col_mod",
+        password="TestPassword123!",
+        role=ModeratorRole.MODERATOR,
+    )
+
+    # Add both public and internal updates
+    await moderator_service.add_report_update(
+        db_session,
+        report_id=r.id,
+        message="Public update for projection test",
+        update_type=ReportUpdateType.PUBLIC_UPDATE,
+        moderator_id=mod.id,
+    )
+    await moderator_service.add_report_update(
+        db_session,
+        report_id=r.id,
+        message="Internal note for projection test",
+        update_type=ReportUpdateType.INTERNAL_NOTE,
+        moderator_id=mod.id,
+    )
+
+    executed_statements = []
+    original_execute = db_session.execute
+
+    async def tracking_execute(statement, *args, **kwargs):
+        executed_statements.append(statement)
+        return await original_execute(statement, *args, **kwargs)
+
+    db_session.execute = tracking_execute
+    try:
+        detail = await moderator_service.get_report_detail_by_id(db_session, r.id)
+        assert detail is not None
+        assert len(detail.updates) == 2
+
+        # Statement 0: get_report_by_id (Report columns)
+        # Statement 1: stmt_updates (ReportUpdate columns)
+        updates_stmt = executed_statements[1]
+        selected_columns = [col.name for col in updates_stmt.selected_columns]
+        expected_columns = [
+            "id",
+            "message",
+            "type",
+            "created_at",
+            "created_by",
+        ]
+        assert selected_columns == expected_columns
+        # Ensure sensitive or unneeded columns are absent
+        assert "report_id" not in selected_columns  # Only needed in WHERE clause
+        assert "case_code_digest" not in selected_columns
+    finally:
+        db_session.execute = original_execute
+
+
+@pytest.mark.asyncio
+async def test_public_tracking_updates_query_column_least_privilege(db_session: AsyncSession):
+    """Verify public tracking query selects only message and created_at columns."""
+    r, case_code = await report_service.create_report(
+        db_session,
+        ReportCreate(category=ReportCategory.SECURITY, description="Tracking projection test"),
+    )
+    mod = await auth_service.create_moderator(
+        db_session,
+        username="tracking_query_col_mod",
+        password="TestPassword123!",
+        role=ModeratorRole.MODERATOR,
+    )
+    await moderator_service.add_report_update(
+        db_session,
+        report_id=r.id,
+        message="Public tracking update",
+        update_type=ReportUpdateType.PUBLIC_UPDATE,
+        moderator_id=mod.id,
+    )
+
+    executed_statements = []
+    original_execute = db_session.execute
+
+    async def tracking_execute(statement, *args, **kwargs):
+        executed_statements.append(statement)
+        return await original_execute(statement, *args, **kwargs)
+
+    db_session.execute = tracking_execute
+    try:
+        tracking = await report_service.get_report_tracking(db_session, case_code)
+        assert tracking is not None
+        assert len(tracking.updates) == 1
+
+        # Statement 0: query Report by case_code_digest
+        # Statement 1: query ReportUpdate
+        updates_stmt = executed_statements[1]
+        selected_columns = [col.name for col in updates_stmt.selected_columns]
+        assert selected_columns == ["message", "created_at"]
+        assert "id" not in selected_columns
+        assert "created_by" not in selected_columns
+        assert "type" not in selected_columns
+    finally:
+        db_session.execute = original_execute
+
 
 

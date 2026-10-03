@@ -190,14 +190,21 @@ class ModeratorService:
         if report_summary is None:
             return None
 
-        # 2. Fetch chronological updates (both PUBLIC_UPDATE and INTERNAL_NOTE)
+        # 2. Fetch chronological updates (both PUBLIC_UPDATE and INTERNAL_NOTE) with least-privilege column selection
+        # Strictly selects only fields required by ModeratorUpdateResponse.
         stmt_updates = (
-            sa.select(ReportUpdate)
+            sa.select(
+                ReportUpdate.id,
+                ReportUpdate.message,
+                ReportUpdate.type,
+                ReportUpdate.created_at,
+                ReportUpdate.created_by,
+            )
             .where(ReportUpdate.report_id == report_id)
-            .order_by(ReportUpdate.created_at.asc())
+            .order_by(ReportUpdate.created_at.asc(), ReportUpdate.id.asc())
         )
         res_updates = await db.execute(stmt_updates)
-        updates = res_updates.scalars().all()
+        update_rows = res_updates.all()
 
         update_responses = [
             ModeratorUpdateResponse(
@@ -207,7 +214,7 @@ class ModeratorService:
                 created_at=u.created_at,
                 created_by=u.created_by,
             )
-            for u in updates
+            for u in update_rows
         ]
 
         return ModeratorReportDetailResponse(

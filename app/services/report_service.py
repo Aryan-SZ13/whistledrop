@@ -120,17 +120,21 @@ class ReportService:
         if report is None:
             return None
 
-        # 4. Query chronological public updates specifically (avoids loading audit_logs, moderators, or internal notes)
+        # 4. Query chronological public updates with least-privilege column selection
+        # Strictly selects only message and created_at, filtering by PUBLIC_UPDATE.
         stmt_updates = (
-            sa.select(ReportUpdate)
+            sa.select(
+                ReportUpdate.message,
+                ReportUpdate.created_at,
+            )
             .where(
                 ReportUpdate.report_id == report.id,
                 ReportUpdate.type == ReportUpdateType.PUBLIC_UPDATE,
             )
-            .order_by(ReportUpdate.created_at.asc())
+            .order_by(ReportUpdate.created_at.asc(), ReportUpdate.id.asc())
         )
         res_updates = await db.execute(stmt_updates)
-        updates = res_updates.scalars().all()
+        update_rows = res_updates.all()
 
         # 5. Construct public tracking response with strict field minimization
         public_updates = [
@@ -138,7 +142,7 @@ class ReportService:
                 message=u.message,
                 created_at=u.created_at,
             )
-            for u in updates
+            for u in update_rows
         ]
 
         return ReportTrackingResponse(
