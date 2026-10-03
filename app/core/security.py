@@ -11,7 +11,8 @@ import jwt
 
 from app.core.config import settings
 
-# OWASP recommended parameters for Argon2id
+# Argon2id parameters chosen above OWASP's current minimum baseline
+# as an intentional engineering tradeoff (memory: 64 MiB, time: 3 iterations, parallelism: 4 lanes)
 _password_hasher = PasswordHasher(
     time_cost=3,
     memory_cost=65536,
@@ -50,8 +51,8 @@ def derive_case_code_digest(case_code: str) -> str:
 def normalize_username(username: str) -> str:
     """Normalize username to canonical lowercase form with whitespace stripped.
 
-    Ensures that usernames such as 'Admin', 'admin', and ' ADMIN ' resolve to the
-    same identity without case or whitespace collision vulnerabilities.
+    Username canonicalization prevents casing and surrounding-whitespace ambiguity.
+    It is not a Unicode confusable/homograph defense.
     """
     if not username or not username.strip():
         raise ValueError("Username must not be empty.")
@@ -59,7 +60,7 @@ def normalize_username(username: str) -> str:
 
 
 def hash_password(password: str) -> str:
-    """Hash a plaintext password using Argon2id with OWASP-recommended parameters."""
+    """Hash a plaintext password using Argon2id configured above OWASP minimum baseline."""
     if not password:
         raise ValueError("Password must not be empty.")
     return _password_hasher.hash(password)
@@ -80,13 +81,14 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 
 def create_access_token(
     subject: str,
-    role: str,
     expires_delta: Optional[timedelta] = None,
 ) -> str:
     """Create a signed, short-lived JWT access token for moderator authentication.
 
     Uses JWT_SECRET exclusively (never CASE_CODE_SECRET).
-    Includes subject (moderator ID), role, issued-at ('iat'), and expiration ('exp').
+    Payload strictly contains: 'sub', 'iat', 'exp', 'iss', 'aud'.
+    Does NOT contain role, passwords, hashes, case codes, report data, or PII.
+    The database remains the authoritative source of truth for user roles and status.
     """
     now = datetime.now(timezone.utc)
     if expires_delta is not None:
@@ -96,23 +98,33 @@ def create_access_token(
 
     payload: Dict[str, Any] = {
         "sub": str(subject),
-        "role": str(role),
         "iat": int(now.timestamp()),
         "exp": int(expire.timestamp()),
+        "iss": settings.JWT_ISSUER,
+        "aud": settings.JWT_AUDIENCE,
     }
     return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
 
 
 def decode_access_token(token: str) -> Dict[str, Any]:
-    """Decode and validate a JWT access token using JWT_SECRET and the configured algorithm.
+    """Decode and validate a JWT access token against configured issuer, audience, and algorithm.
 
-    Raises jwt.PyJWTError subclasses (ExpiredSignatureError, InvalidTokenError, etc.)
-    if the token is invalid, expired, or uses an unauthorized algorithm.
+    Raises jwt.PyJWTError subclasses (ExpiredSignatureError, InvalidTokenError,
+    InvalidIssuerError, InvalidAudienceError, MissingRequiredClaimError)
+    if the token is invalid, expired, unverified, or uses an unauthorized algorithm.
     """
     return jwt.decode(
         token,
         settings.JWT_SECRET,
         algorithms=[settings.JWT_ALGORITHM],
-        options={"require": ["sub", "role", "iat", "exp"]},
+        issuer=settings.JWT_ISSUER,
+        audience=settings.JWT_AUDIENCE,
+        options={
+            "require": ["sub", "iat", "exp", "iss", "aud"],
+            "verify_iss": True,
+            "verify_aud": True,
+            "verify_exp": True,
+        },
     )
+
 

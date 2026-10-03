@@ -43,37 +43,12 @@ async def login(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    logger.info("Moderator login successful: username=%s", moderator.username)
+    # Operational audit-oriented logging: records moderator UUID and role for accountability.
+    # NEVER log passwords, password hashes, JWT tokens, case codes, or report data.
+    logger.info(
+        "AUDIT: Moderator authentication successful: moderator_id=%s, role=%s",
+        moderator.id,
+        moderator.role.value,
+    )
     return auth_service.issue_token(moderator)
 
-
-@router.get(
-    "/test-moderator",
-    summary="Test moderator authorization dependency",
-    description="Endpoint accessible to moderators and administrators.",
-)
-async def test_moderator_access(
-    current_moderator: Moderator = Depends(require_moderator),
-) -> Dict[str, Any]:
-    """Verify require_moderator dependency."""
-    return {
-        "status": "ok",
-        "username": current_moderator.username,
-        "role": current_moderator.role.value,
-    }
-
-
-@router.get(
-    "/test-admin",
-    summary="Test admin authorization dependency",
-    description="Endpoint strictly accessible only to administrators.",
-)
-async def test_admin_access(
-    current_moderator: Moderator = Depends(require_admin),
-) -> Dict[str, Any]:
-    """Verify require_admin dependency."""
-    return {
-        "status": "ok",
-        "username": current_moderator.username,
-        "role": current_moderator.role.value,
-    }

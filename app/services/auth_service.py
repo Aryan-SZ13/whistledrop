@@ -54,6 +54,11 @@ class AuthService:
         if moderator is None:
             return None
 
+        # Disabled accounts cannot authenticate
+        if not moderator.is_active:
+            logger.warning("Authentication attempted for inactive moderator: username=%s", canonical_username)
+            return None
+
         if not verify_password(password, moderator.password_hash):
             return None
 
@@ -75,6 +80,7 @@ class AuthService:
         username: str,
         password: str,
         role: ModeratorRole = ModeratorRole.MODERATOR,
+        is_active: bool = True,
     ) -> Moderator:
         """Create a new moderator with normalized username and Argon2id hashed password.
 
@@ -87,17 +93,35 @@ class AuthService:
             username=canonical_username,
             password_hash=pwd_hash,
             role=role,
+            is_active=is_active,
         )
         db.add(moderator)
         await db.commit()
         await db.refresh(moderator)
         return moderator
 
+    async def deactivate_moderator(
+        self,
+        db: AsyncSession,
+        moderator_id: uuid.UUID,
+    ) -> Optional[Moderator]:
+        """Deactivate a moderator account without deleting historical records."""
+        moderator = await self.get_moderator_by_id(db, moderator_id)
+        if moderator is None:
+            return None
+        moderator.is_active = False
+        await db.commit()
+        await db.refresh(moderator)
+        return moderator
+
     def issue_token(self, moderator: Moderator) -> TokenResponse:
-        """Issue a signed JWT access token for an authenticated moderator."""
+        """Issue a signed JWT access token for an authenticated moderator.
+
+        Database Moderator.role remains the authoritative source of truth.
+        Role is not embedded in the token payload.
+        """
         access_token = create_access_token(
             subject=str(moderator.id),
-            role=moderator.role.value,
         )
         expires_in = settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
         return TokenResponse(
@@ -105,6 +129,7 @@ class AuthService:
             token_type="bearer",
             expires_in=expires_in,
         )
+
 
 
 auth_service = AuthService()

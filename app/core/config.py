@@ -23,11 +23,14 @@ class Settings(BaseSettings):
     DEBUG: Optional[bool] = None
     API_V1_PREFIX: str = "/api/v1"
 
-    # Distinct Cryptographic Secrets
+    # Distinct Cryptographic Secrets & JWT Configuration
     JWT_SECRET: str = DEV_INSECURE_JWT_SECRET
     CASE_CODE_SECRET: str = DEV_INSECURE_CASE_CODE_SECRET
     JWT_ALGORITHM: str = "HS256"
+    JWT_ISSUER: str = "whistledrop-api"
+    JWT_AUDIENCE: str = "whistledrop-moderators"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+
 
     # Configurable CORS Origins
     BACKEND_CORS_ORIGINS: Union[List[str], str] = []

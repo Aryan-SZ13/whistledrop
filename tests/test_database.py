@@ -78,6 +78,28 @@ async def test_unique_constraint_moderator_username(db_session: AsyncSession):
 
 
 @pytest.mark.asyncio
+async def test_moderator_is_active_default_and_persistence(db_session: AsyncSession):
+    """Verify is_active column defaults to True and can be deactivated in PostgreSQL."""
+    mod = Moderator(
+        username="active_user",
+        password_hash="hashed_pw_active",
+        role=ModeratorRole.MODERATOR,
+    )
+    db_session.add(mod)
+    await db_session.flush()
+    await db_session.refresh(mod)
+
+    assert mod.is_active is True
+
+    # Test explicit deactivation
+    mod.is_active = False
+    await db_session.flush()
+    await db_session.refresh(mod)
+    assert mod.is_active is False
+
+
+
+@pytest.mark.asyncio
 async def test_unique_constraint_case_code_digest(db_session: AsyncSession):
     """Verify database enforces unique case_code_digest values for reports."""
     digest = "unique_sha256_digest_token_12345"

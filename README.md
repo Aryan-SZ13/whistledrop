@@ -105,19 +105,25 @@ Security controls are implemented with defense-in-depth:
    - *Whistleblowers:* Never register, provide credentials, or establish sessions. Access to case tracking is authenticated purely via bearer case-code possession.
    - *Moderators / Admins:* Internal personnel undergo credential authentication (`POST /api/v1/auth/login`) to receive short-lived bearer JWTs for role-gated administration.
 4. **Moderator Password Hashing & Canonicalization:**
-   - Password hashing uses **Argon2id** (`argon2-cffi`) configured with OWASP-recommended parameters: `time_cost=3`, `memory_cost=65536` (64 MiB), `parallelism=4`, `hash_len=32`, and `salt_len=16`.
-   - Usernames are canonicalized (stripped and converted to lowercase) upon creation and login to prevent homograph, casing, and whitespace collision bypasses.
+   - Password hashing uses **Argon2id** (`argon2-cffi`). The configuration (`time_cost=3`, `memory_cost=65536` [64 MiB], `parallelism=4`, `hash_len=32`, `salt_len=16`) is intentionally above OWASP's current minimum Argon2id baseline and was chosen as an engineering tradeoff between memory hardness and authentication latency.
+   - Username canonicalization prevents casing and surrounding-whitespace ambiguity. It is not a Unicode confusable/homograph defense.
    - Failed authentication yields a uniform `401 Unauthorized` (`"Incorrect username or password"`) without revealing whether the username exists or the password was incorrect.
-5. **Short-Lived JWT Bearer Tokens:**
+5. **Context-Bound Short-Lived JWT Bearer Tokens:**
    - Issued upon successful moderator authentication with a 30-minute expiration (`ACCESS_TOKEN_EXPIRE_MINUTES=30`).
    - Signed using `HS256` with `JWT_SECRET`. Algorithm confusion is strictly prevented by specifying the allowed algorithm list during token decoding.
-   - Payload contains standard claims: `sub` (moderator UUID), `role` (`MODERATOR` or `ADMIN`), `iat` (issued-at timestamp), and `exp` (expiration timestamp).
-   - Plaintext passwords, password hashes, and secrets are strictly excluded from JWT claims, logs, and API responses.
-6. **Role-Based Access Control (RBAC):**
-   - Tiered authorization dependencies enforce least privilege:
+   - Context binding: Every token includes explicit `iss` (`JWT_ISSUER`) and `aud` (`JWT_AUDIENCE`) claims, strictly verified upon decoding.
+   - *Role Source of Truth:* The database `Moderator.role` is the authoritative source for authorization; `role` is intentionally excluded from the JWT payload, preventing token-level privilege escalation.
+   - Payload strictly contains: `sub`, `iat`, `exp`, `iss`, `aud`. Plaintext passwords, password hashes, secrets, case codes, report data, and PII are strictly excluded.
+6. **Moderator Account Lifecycle & Inactive Account Enforcement:**
+   - The `Moderator` model includes an `is_active` boolean field (default: `True`).
+   - Authentication flow enforces: JWT signature/claims validation → load moderator from DB → check `is_active` → authorize moderator.
+   - Deactivated moderators (`is_active=False`) are rejected during both login and token validation with a generic `401 Unauthorized` response (`"Could not validate credentials"`).
+   - Account deactivation is non-destructive, preserving historical associations with audit logs and report updates without requiring user deletion.
+7. **Role-Based Access Control (RBAC):**
+   - Tiered authorization dependencies enforce least privilege using database records as the source of truth:
      - `require_moderator`: Permits authorized `MODERATOR` and `ADMIN` personnel to perform triage operations.
      - `require_admin`: Strictly limits privileged configurations and admin actions to `ADMIN` accounts.
-7. **Internal ID Concealment & Public Data Minimization:**
+8. **Internal ID Concealment & Public Data Minimization:**
    - Internal database primary keys (UUIDs) remain strictly internal and are never exposed in public endpoints.
    - Public report ingestion response schema (`POST /api/v1/reports`):
      ```json
@@ -140,13 +146,13 @@ Security controls are implemented with defense-in-depth:
      }
      ```
      *Strict Omission:* Internal UUIDs, case_code_digest, description, evidence_url, audit logs, and moderator identities are completely excluded from public tracking.
-8. **Metadata-Only Evidence Handling:**
+9. **Metadata-Only Evidence Handling:**
    - Submitted `evidence_url` values are strictly validated via structured URL parsers and stored purely as text metadata. The server never makes outbound HTTP requests or fetches submitted URLs, eliminating Server-Side Request Forgery (SSRF) risks.
-9. **Production-Hardened Defaults:**
-   - `DEBUG` is strictly enforced to `False` in production environments.
-   - OpenAPI documentation endpoints (`/docs`, `/redoc`, `/openapi.json`) are disabled when `DEBUG=False` to prevent API schema reconnaissance.
-   - Minimum entropy requirements (min 32 characters) and placeholder rejection are enforced for production secrets at application startup.
-10. **Restrictive CORS:**
+10. **Production-Hardened Defaults:**
+    - `DEBUG` is strictly enforced to `False` in production environments.
+    - OpenAPI documentation endpoints (`/docs`, `/redoc`, `/openapi.json`) are disabled when `DEBUG=False` to prevent API schema reconnaissance.
+    - Minimum entropy requirements (min 32 characters) and placeholder rejection are enforced for production secrets at application startup.
+11. **Restrictive CORS:**
     - Permissive wildcard origins (`allow_origins=["*"]`) are prohibited.
     - `allow_credentials` is set to `False` by default because authentication uses `Authorization: Bearer <token>` headers rather than browser cookies.
     - In production, CORS defaults to an empty allowlist (enforcing strict browser Same-Origin Policy) unless explicit origins are configured.
@@ -161,7 +167,7 @@ Security controls are implemented with defense-in-depth:
 | **Traffic Correlation / Metadata Leakage** | Correlating report submissions with network traffic or server logs. | Application models and application logs omit submitter identity and network metadata; infrastructure ingress proxies must be configured to discard or anonymize access logs. |
 | **Cross-Domain Secret Compromise** | Compromise of moderator JWT secrets impacting report access. | Cryptographic secret separation; `JWT_SECRET` and `CASE_CODE_SECRET` are independent keys validated to never share values. |
 | **API Schema Reconnaissance** | Attackers scanning interactive API documentation to map out endpoints and attack vectors. | Automatic suppression of Swagger UI (`/docs`), ReDoc (`/redoc`), and OpenAPI schema (`/openapi.json`) when `DEBUG=False` in production. |
-| **Unauthorized Moderator Access** | Malicious actors accessing case management records. | Argon2id password hashing, canonical username normalization, Role-Based Access Control (RBAC), short-lived JWTs, and structured audit logs for all moderator actions. |
+| **Unauthorized Moderator Access** | Malicious actors accessing case management records. | Argon2id password hashing, canonical username normalization, active account verification (`is_active`), Role-Based Access Control (RBAC), context-bound JWTs, and structured audit logs. |
 
 ---
 
@@ -173,8 +179,10 @@ Security controls are implemented with defense-in-depth:
 - [x] **Phase 2:** Secure Anonymous Report Ingestion & Cryptographic Case-Code Generation
 - [x] **Phase 3:** Public Anonymous Case Tracking & Status Updates
 - [x] **Phase 4:** Moderator Authentication & Role-Based Access Control (RBAC)
+- [x] **Phase 4.1:** Authentication Lifecycle Hardening (Account Lifecycle `is_active`, Context-Bound JWTs, DB Role Authority, Test Endpoint Removal)
 - [ ] **Phase 5 (Planned):** Case Status Lifecycle Management & Immutable Audit Trail
 - [ ] **Phase 6 (Planned):** Evidence Attachment Storage & Advanced Defense (Rate Limiting, ClamAV Scanning)
+
 
 
 ---

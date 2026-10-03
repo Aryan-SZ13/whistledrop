@@ -63,11 +63,20 @@ async def get_current_moderator(
     if moderator is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found",
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if not moderator.is_active:
+        logger.warning("Access attempted with valid token for inactive moderator: id=%s", moderator_id)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
     return moderator
+
 
 
 async def require_moderator(
