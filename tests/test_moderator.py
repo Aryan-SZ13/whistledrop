@@ -414,3 +414,388 @@ async def test_moderator_service_defensive_bounds_validation(db_session: AsyncSe
     with pytest.raises(ValueError, match="offset must be non-negative"):
         await moderator_service.list_reports(db_session, offset=-1)
 
+
+# ==============================================================================
+# Phase 6: Lifecycle State Machine, Updates, Auditing & Atomicity Tests
+# ==============================================================================
+
+@pytest.mark.asyncio
+async def test_state_machine_valid_transitions(client, db_session: AsyncSession):
+    """Verify valid transitions: SUBMITTED -> UNDER_REVIEW -> RESOLVED / DISMISSED."""
+    headers = await create_auth_headers(db_session, role=ModeratorRole.MODERATOR, username="lifecycle_mod")
+
+    # 1. SUBMITTED -> UNDER_REVIEW -> RESOLVED
+    r1, _ = await report_service.create_report(
+        db_session,
+        ReportCreate(category=ReportCategory.SECURITY, description="Report 1 for lifecycle test"),
+    )
+    res1 = client.patch(
+        f"/api/v1/moderator/reports/{r1.id}/status",
+        headers=headers,
+        json={"status": "UNDER_REVIEW"},
+    )
+    assert res1.status_code == 200
+    assert res1.json()["status"] == "UNDER_REVIEW"
+
+    res1_resolved = client.patch(
+        f"/api/v1/moderator/reports/{r1.id}/status",
+        headers=headers,
+        json={"status": "RESOLVED"},
+    )
+    assert res1_resolved.status_code == 200
+    assert res1_resolved.json()["status"] == "RESOLVED"
+
+    # 2. SUBMITTED -> UNDER_REVIEW -> DISMISSED
+    r2, _ = await report_service.create_report(
+        db_session,
+        ReportCreate(category=ReportCategory.CORRUPTION, description="Report 2 for lifecycle test"),
+    )
+    res2 = client.patch(
+        f"/api/v1/moderator/reports/{r2.id}/status",
+        headers=headers,
+        json={"status": "UNDER_REVIEW"},
+    )
+    assert res2.status_code == 200
+
+    res2_dismissed = client.patch(
+        f"/api/v1/moderator/reports/{r2.id}/status",
+        headers=headers,
+        json={"status": "DISMISSED"},
+    )
+    assert res2_dismissed.status_code == 200
+    assert res2_dismissed.json()["status"] == "DISMISSED"
+
+
+@pytest.mark.asyncio
+async def test_state_machine_invalid_transitions_rejected_with_409(client, db_session: AsyncSession):
+    """Verify illegal transitions are rejected with 409 Conflict."""
+    headers = await create_auth_headers(db_session, role=ModeratorRole.MODERATOR, username="invalid_trans_mod")
+
+    # A. SUBMITTED -> RESOLVED (Illegal)
+    r1, _ = await report_service.create_report(
+        db_session,
+        ReportCreate(category=ReportCategory.SECURITY, description="Direct resolve attempt"),
+    )
+    res_direct_res = client.patch(
+        f"/api/v1/moderator/reports/{r1.id}/status",
+        headers=headers,
+        json={"status": "RESOLVED"},
+    )
+    assert res_direct_res.status_code == 409
+    assert "Invalid report lifecycle transition" in res_direct_res.json()["detail"]
+
+    # B. SUBMITTED -> DISMISSED (Illegal)
+    res_direct_dism = client.patch(
+        f"/api/v1/moderator/reports/{r1.id}/status",
+        headers=headers,
+        json={"status": "DISMISSED"},
+    )
+    assert res_direct_dism.status_code == 409
+
+    # C. UNDER_REVIEW -> SUBMITTED (Illegal backwards transition)
+    client.patch(
+        f"/api/v1/moderator/reports/{r1.id}/status",
+        headers=headers,
+        json={"status": "UNDER_REVIEW"},
+    )
+    res_back = client.patch(
+        f"/api/v1/moderator/reports/{r1.id}/status",
+        headers=headers,
+        json={"status": "SUBMITTED"},
+    )
+    assert res_back.status_code == 409
+
+    # D. RESOLVED -> anything (Terminal state)
+    client.patch(
+        f"/api/v1/moderator/reports/{r1.id}/status",
+        headers=headers,
+        json={"status": "RESOLVED"},
+    )
+    res_after_resolved = client.patch(
+        f"/api/v1/moderator/reports/{r1.id}/status",
+        headers=headers,
+        json={"status": "UNDER_REVIEW"},
+    )
+    assert res_after_resolved.status_code == 409
+
+    # E. DISMISSED -> anything (Terminal state)
+    r2, _ = await report_service.create_report(
+        db_session,
+        ReportCreate(category=ReportCategory.OTHER, description="Dismissed terminal check"),
+    )
+    client.patch(
+        f"/api/v1/moderator/reports/{r2.id}/status",
+        headers=headers,
+        json={"status": "UNDER_REVIEW"},
+    )
+    client.patch(
+        f"/api/v1/moderator/reports/{r2.id}/status",
+        headers=headers,
+        json={"status": "DISMISSED"},
+    )
+    res_after_dismissed = client.patch(
+        f"/api/v1/moderator/reports/{r2.id}/status",
+        headers=headers,
+        json={"status": "RESOLVED"},
+    )
+    assert res_after_dismissed.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_status_mutation_auth_boundaries(client, db_session: AsyncSession):
+    """Verify status mutation requires active authenticated moderator or admin."""
+    r, _ = await report_service.create_report(
+        db_session,
+        ReportCreate(category=ReportCategory.SECURITY, description="Auth check report"),
+    )
+
+    # 1. Unauthenticated -> 401
+    res_unauth = client.patch(f"/api/v1/moderator/reports/{r.id}/status", json={"status": "UNDER_REVIEW"})
+    assert res_unauth.status_code == 401
+
+    # 2. Invalid JWT -> 401
+    res_bad_jwt = client.patch(
+        f"/api/v1/moderator/reports/{r.id}/status",
+        headers={"Authorization": "Bearer bad.token"},
+        json={"status": "UNDER_REVIEW"},
+    )
+    assert res_bad_jwt.status_code == 401
+
+    # 3. Inactive moderator -> 401
+    inactive_headers = await create_auth_headers(db_session, is_active=False, username="inactive_mod_status")
+    res_inactive = client.patch(
+        f"/api/v1/moderator/reports/{r.id}/status",
+        headers=inactive_headers,
+        json={"status": "UNDER_REVIEW"},
+    )
+    assert res_inactive.status_code == 401
+
+    # 4. Admin can mutate -> 200
+    admin_headers = await create_auth_headers(db_session, role=ModeratorRole.ADMIN, username="admin_mod_status")
+    res_admin = client.patch(
+        f"/api/v1/moderator/reports/{r.id}/status",
+        headers=admin_headers,
+        json={"status": "UNDER_REVIEW"},
+    )
+    assert res_admin.status_code == 200
+    assert res_admin.json()["status"] == "UNDER_REVIEW"
+
+
+@pytest.mark.asyncio
+async def test_status_mutation_creates_audit_log(client, db_session: AsyncSession):
+    """Verify each status transition generates an AuditLog row with structured safe metadata."""
+    import sqlalchemy as sa
+    from app.models.audit_log import AuditLog
+
+    headers = await create_auth_headers(db_session, username="audit_tester_mod")
+    r, _ = await report_service.create_report(
+        db_session,
+        ReportCreate(category=ReportCategory.TECHNICAL, description="Audit log verification report"),
+    )
+
+    # Trigger transition
+    res = client.patch(
+        f"/api/v1/moderator/reports/{r.id}/status",
+        headers=headers,
+        json={"status": "UNDER_REVIEW"},
+    )
+    assert res.status_code == 200
+
+    # Query audit logs for this report
+    stmt = sa.select(AuditLog).where(
+        AuditLog.report_id == r.id,
+        AuditLog.action == "REPORT_STATUS_CHANGED",
+    )
+    res_audit = await db_session.execute(stmt)
+    logs = res_audit.scalars().all()
+    assert len(logs) == 1
+
+    log = logs[0]
+    assert log.report_id == r.id
+    assert log.moderator_id is not None
+    assert log.metadata_ == {"from_status": "SUBMITTED", "to_status": "UNDER_REVIEW"}
+    assert log.created_at is not None
+
+
+@pytest.mark.asyncio
+async def test_failed_status_transition_creates_no_audit_log(client, db_session: AsyncSession):
+    """Verify atomic rollback: invalid transition produces no new AuditLog rows."""
+    import sqlalchemy as sa
+    from app.models.audit_log import AuditLog
+
+    headers = await create_auth_headers(db_session, username="atomic_fail_mod")
+    r, _ = await report_service.create_report(
+        db_session,
+        ReportCreate(category=ReportCategory.OTHER, description="Rollback audit test"),
+    )
+
+    # Count audit logs before
+    count_before = (
+        await db_session.execute(
+            sa.select(sa.func.count(AuditLog.id)).where(AuditLog.report_id == r.id)
+        )
+    ).scalar()
+
+    # Attempt illegal transition
+    res = client.patch(
+        f"/api/v1/moderator/reports/{r.id}/status",
+        headers=headers,
+        json={"status": "RESOLVED"},
+    )
+    assert res.status_code == 409
+
+    # Count audit logs after
+    count_after = (
+        await db_session.execute(
+            sa.select(sa.func.count(AuditLog.id)).where(AuditLog.report_id == r.id)
+        )
+    ).scalar()
+
+    assert count_after == count_before
+
+
+@pytest.mark.asyncio
+async def test_public_update_vs_internal_note_visibility(client, db_session: AsyncSession):
+    """Verify PUBLIC_UPDATE appears in tracking, while INTERNAL_NOTE is strictly concealed."""
+    headers = await create_auth_headers(db_session, username="note_visibility_mod")
+
+    # 1. Anonymous submission
+    sub_res = client.post(
+        "/api/v1/reports",
+        json={"category": "SECURITY", "description": "Tracking note visibility check incident."},
+    )
+    assert sub_res.status_code == 201
+    case_code = sub_res.json()["case_code"]
+
+    # Retrieve internal report id via moderator list
+    list_res = client.get("/api/v1/moderator/reports", headers=headers)
+    report_id = list_res.json()["items"][0]["id"]
+
+    # 2. Moderator posts a PUBLIC_UPDATE
+    pub_res = client.post(
+        f"/api/v1/moderator/reports/{report_id}/updates",
+        headers=headers,
+        json={
+            "message": "We have received and verified your submission.",
+            "type": "PUBLIC_UPDATE",
+        },
+    )
+    assert pub_res.status_code == 201
+    assert pub_res.json()["type"] == "PUBLIC_UPDATE"
+
+    # 3. Moderator posts an INTERNAL_NOTE
+    note_res = client.post(
+        f"/api/v1/moderator/reports/{report_id}/updates",
+        headers=headers,
+        json={
+            "message": "Internal note: assigned senior analyst Jane Doe for forensic triage.",
+            "type": "INTERNAL_NOTE",
+        },
+    )
+    assert note_res.status_code == 201
+    assert note_res.json()["type"] == "INTERNAL_NOTE"
+
+    # 4. Anonymous tracking GET /api/v1/reports/{case_code}
+    track_res = client.get(f"/api/v1/reports/{case_code}")
+    assert track_res.status_code == 200
+    track_data = track_res.json()
+
+    # Must contain ONLY the public update
+    assert len(track_data["updates"]) == 1
+    assert track_data["updates"][0]["message"] == "We have received and verified your submission."
+    # Internal note must NEVER appear in public response text
+    assert "Internal note" not in track_res.text
+    assert "Jane Doe" not in track_res.text
+    assert "INTERNAL_NOTE" not in track_res.text
+
+    # 5. Moderator detail view GET /api/v1/moderator/reports/{report_id}
+    mod_detail_res = client.get(f"/api/v1/moderator/reports/{report_id}", headers=headers)
+    assert mod_detail_res.status_code == 200
+    mod_detail = mod_detail_res.json()
+
+    # Moderator sees BOTH updates in chronological order
+    assert len(mod_detail["updates"]) == 2
+    types = [u["type"] for u in mod_detail["updates"]]
+    assert types == ["PUBLIC_UPDATE", "INTERNAL_NOTE"]
+    assert "Jane Doe" in mod_detail_res.text
+
+
+@pytest.mark.asyncio
+async def test_update_creation_creates_audit_log(client, db_session: AsyncSession):
+    """Verify creating a report update generates an AuditLog entry without duplicating text."""
+    import sqlalchemy as sa
+    from app.models.audit_log import AuditLog
+
+    headers = await create_auth_headers(db_session, username="update_audit_mod")
+    r, _ = await report_service.create_report(
+        db_session,
+        ReportCreate(category=ReportCategory.CORRUPTION, description="Update audit log report"),
+    )
+
+    res = client.post(
+        f"/api/v1/moderator/reports/{r.id}/updates",
+        headers=headers,
+        json={"message": "Safe update message content", "type": "PUBLIC_UPDATE"},
+    )
+    assert res.status_code == 201
+
+    # Query audit logs
+    stmt = sa.select(AuditLog).where(
+        AuditLog.report_id == r.id,
+        AuditLog.action == "REPORT_UPDATE_CREATED",
+    )
+    res_audit = await db_session.execute(stmt)
+    logs = res_audit.scalars().all()
+    assert len(logs) == 1
+
+    log = logs[0]
+    assert log.report_id == r.id
+    assert log.moderator_id is not None
+    assert log.metadata_["update_type"] == "PUBLIC_UPDATE"
+    # Ensure message content itself is NOT duplicated into audit log metadata
+    assert "Safe update message content" not in str(log.metadata_)
+
+
+@pytest.mark.asyncio
+async def test_moderator_update_validation(client, db_session: AsyncSession):
+    """Verify input validation on update creation: empty, oversized, extra fields."""
+    headers = await create_auth_headers(db_session, username="val_mod")
+    r, _ = await report_service.create_report(
+        db_session,
+        ReportCreate(category=ReportCategory.OTHER, description="Validation test incident"),
+    )
+
+    # 1. Empty message -> 422
+    res_empty = client.post(
+        f"/api/v1/moderator/reports/{r.id}/updates",
+        headers=headers,
+        json={"message": "", "type": "PUBLIC_UPDATE"},
+    )
+    assert res_empty.status_code == 422
+
+    # 2. Oversized message (> 5000 chars) -> 422
+    res_oversized = client.post(
+        f"/api/v1/moderator/reports/{r.id}/updates",
+        headers=headers,
+        json={"message": "A" * 5001, "type": "PUBLIC_UPDATE"},
+    )
+    assert res_oversized.status_code == 422
+
+    # 3. Extra fields forbidden -> 422
+    res_extra = client.post(
+        f"/api/v1/moderator/reports/{r.id}/updates",
+        headers=headers,
+        json={"message": "Valid update", "type": "PUBLIC_UPDATE", "moderator_id": str(uuid.uuid4())},
+    )
+    assert res_extra.status_code == 422
+
+    # 4. Unknown report ID -> 404
+    res_unknown = client.post(
+        f"/api/v1/moderator/reports/{uuid.uuid4()}/updates",
+        headers=headers,
+        json={"message": "Valid update", "type": "PUBLIC_UPDATE"},
+    )
+    assert res_unknown.status_code == 404
+    assert res_unknown.json()["detail"] == "Report not found"
+
+

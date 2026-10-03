@@ -5,7 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import derive_case_code_digest, generate_case_code
 from app.models.audit_log import AuditLog
-from app.models.enums import ReportStatus
+from app.models.enums import ReportStatus, ReportUpdateType
 from app.models.report import Report
 from app.models.report_update import ReportUpdate
 from app.schemas.report import (
@@ -120,10 +120,13 @@ class ReportService:
         if report is None:
             return None
 
-        # 4. Query chronological updates specifically (avoids loading audit_logs or moderators)
+        # 4. Query chronological public updates specifically (avoids loading audit_logs, moderators, or internal notes)
         stmt_updates = (
             sa.select(ReportUpdate)
-            .where(ReportUpdate.report_id == report.id)
+            .where(
+                ReportUpdate.report_id == report.id,
+                ReportUpdate.type == ReportUpdateType.PUBLIC_UPDATE,
+            )
             .order_by(ReportUpdate.created_at.asc())
         )
         res_updates = await db.execute(stmt_updates)

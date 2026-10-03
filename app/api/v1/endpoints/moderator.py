@@ -10,10 +10,18 @@ from app.db.session import get_db
 from app.models.enums import ReportCategory, ReportStatus
 from app.models.moderator import Moderator
 from app.schemas.moderator import (
+    ModeratorReportDetailResponse,
     ModeratorReportListResponse,
     ModeratorReportResponse,
+    ModeratorUpdateCreate,
+    ModeratorUpdateResponse,
+    ReportStatusUpdateRequest,
 )
-from app.services.moderator_service import moderator_service
+from app.services.moderator_service import (
+    InvalidStateTransitionError,
+    ReportNotFoundError,
+    moderator_service,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,21 +64,86 @@ async def list_reports(
 
 @router.get(
     "/reports/{report_id}",
-    response_model=ModeratorReportResponse,
+    response_model=ModeratorReportDetailResponse,
     status_code=status.HTTP_200_OK,
-    summary="Inspect single report",
-    description="Retrieve detailed moderation view for a specific report by internal UUID.",
+    summary="Inspect single report with updates",
+    description="Retrieve detailed moderation view for a specific report including chronological public updates and internal notes.",
 )
 async def get_report(
     report_id: uuid.UUID = Path(..., description="Internal report UUID"),
     current_moderator: Moderator = Depends(require_moderator),
     db: AsyncSession = Depends(get_db),
-) -> ModeratorReportResponse:
-    """Inspect an individual report by UUID for authorized moderators."""
-    report = await moderator_service.get_report_by_id(db, report_id)
+) -> ModeratorReportDetailResponse:
+    """Inspect an individual report with its updates by UUID for authorized moderators."""
+    report = await moderator_service.get_report_detail_by_id(db, report_id)
     if report is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Report not found",
         )
     return report
+
+
+@router.patch(
+    "/reports/{report_id}/status",
+    response_model=ModeratorReportResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Update report lifecycle status",
+    description="Transition a report to a new lifecycle status according to strict state machine rules.",
+)
+async def update_report_status(
+    status_update: ReportStatusUpdateRequest,
+    report_id: uuid.UUID = Path(..., description="Internal report UUID"),
+    current_moderator: Moderator = Depends(require_moderator),
+    db: AsyncSession = Depends(get_db),
+) -> ModeratorReportResponse:
+    """Update report lifecycle status atomically with audit logging."""
+    try:
+        updated = await moderator_service.update_report_status(
+            db=db,
+            report_id=report_id,
+            new_status=status_update.status,
+            moderator_id=current_moderator.id,
+        )
+        return updated
+    except ReportNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Report not found",
+        )
+    except InvalidStateTransitionError as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(e),
+        )
+
+
+@router.post(
+    "/reports/{report_id}/updates",
+    response_model=ModeratorUpdateResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Post update or internal note",
+    description="Post a public timeline update or an internal review note to a report.",
+)
+async def add_report_update(
+    update_in: ModeratorUpdateCreate,
+    report_id: uuid.UUID = Path(..., description="Internal report UUID"),
+    current_moderator: Moderator = Depends(require_moderator),
+    db: AsyncSession = Depends(get_db),
+) -> ModeratorUpdateResponse:
+    """Post an update or note to a report atomically with audit logging."""
+    try:
+        result = await moderator_service.add_report_update(
+            db=db,
+            report_id=report_id,
+            message=update_in.message,
+            update_type=update_in.type,
+            moderator_id=current_moderator.id,
+        )
+        return result
+    except ReportNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Report not found",
+        )
+

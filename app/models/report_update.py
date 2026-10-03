@@ -5,6 +5,7 @@ import sqlalchemy as sa
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base
+from app.models.enums import ReportUpdateType
 
 if TYPE_CHECKING:
     from app.models.report import Report
@@ -23,6 +24,17 @@ class ReportUpdate(Base):
         sa.Uuid(as_uuid=True),
         sa.ForeignKey("reports.id", ondelete="CASCADE"),
         nullable=False,
+        index=True,
+    )
+    type: Mapped[ReportUpdateType] = mapped_column(
+        sa.Enum(
+            ReportUpdateType,
+            name="report_update_type_enum",
+            native_enum=True,
+            values_callable=lambda obj: [e.value for e in obj],
+        ),
+        nullable=False,
+        default=ReportUpdateType.PUBLIC_UPDATE,
         index=True,
     )
     message: Mapped[str] = mapped_column(

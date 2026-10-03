@@ -18,7 +18,14 @@ class ReportStatus(str, enum.Enum):
     DISMISSED = "DISMISSED"
 
 
+class ReportUpdateType(str, enum.Enum):
+    """Visibility types for updates posted to a report."""
+    PUBLIC_UPDATE = "PUBLIC_UPDATE"
+    INTERNAL_NOTE = "INTERNAL_NOTE"
+
+
 class ModeratorRole(str, enum.Enum):
     """Roles and authorization tiers for moderators."""
     MODERATOR = "MODERATOR"
     ADMIN = "ADMIN"
+

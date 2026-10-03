@@ -167,6 +167,11 @@ Security controls are implemented with defense-in-depth:
     - Permissive wildcard origins (`allow_origins=["*"]`) are prohibited.
     - `allow_credentials` is set to `False` by default because authentication uses `Authorization: Bearer <token>` headers rather than browser cookies.
     - In production, CORS defaults to an empty allowlist (enforcing strict browser Same-Origin Policy) unless explicit origins are configured.
+13. **Case Lifecycle State Machine, Public/Internal Update Separation & Auditing:**
+    - *Lifecycle State Machine:* Report status transitions are strictly governed by an explicit domain state machine (`SUBMITTED -> UNDER_REVIEW -> RESOLVED | DISMISSED`). Illegal transitions are rejected with HTTP 409 Conflict.
+    - *Concurrency & Atomic Mutations:* Transitions and update posts utilize row-level locking (`SELECT ... FOR UPDATE`) and atomic transactional persistence, ensuring report updates, status mutations, and audit records commit together or roll back completely.
+    - *Visibility Separation:* Updates to reports are categorized as either `PUBLIC_UPDATE` (visible to the anonymous reporter in case tracking) or `INTERNAL_NOTE` (strictly accessible only via authorized moderator endpoints).
+    - *Append-Only Audit Trail:* All moderation actions generate structured `AuditLog` records containing controlled metadata (e.g. `from_status`, `to_status`, `update_type`). Passwords, JWTs, case codes, and free-text notes are never stored in audit metadata. (Note: Current audit logs are append-only at the application level; cryptographic tamper-evidence is reserved for future phases).
 
 ---
 
@@ -193,7 +198,8 @@ Security controls are implemented with defense-in-depth:
 - [x] **Phase 4.1:** Authentication Lifecycle Hardening (Account Lifecycle `is_active`, Context-Bound JWTs, DB Role Authority, Test Endpoint Removal)
 - [x] **Phase 4.2:** Authentication Enumeration & Timing Hardening (Fixed Dummy Argon2id Verification)
 - [x] **Phase 5:** Protected Moderator Control Plane (Report Listing, Filtering, Bounded Pagination, and Detail Inspection)
-- [ ] **Phase 6 (Planned):** Case Status Lifecycle Management & Immutable Audit Trail
+- [x] **Phase 5.1:** Moderator Query Least-Privilege Hardening (Explicit SQL Column Projections)
+- [x] **Phase 6:** Case Lifecycle State Machine, Public/Internal Update Separation, and Auditing
 - [ ] **Phase 7 (Planned):** Evidence Attachment Storage & Advanced Defense (Rate Limiting, ClamAV Scanning)
 
 
