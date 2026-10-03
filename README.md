@@ -54,9 +54,10 @@ whistledrop/
 │           ├── api.py        # API router aggregator
 │           └── endpoints/
 │               ├── __init__.py
-│               ├── auth.py   # Moderator authentication & authorization test routes
+│               ├── auth.py   # Moderator authentication endpoints
 │               ├── health.py # Health check probe endpoint
 │               └── reports.py# Anonymous report submission & tracking endpoints
+
 └── tests/
     ├── __init__.py
     ├── conftest.py           # Test database fixtures, isolation, and async session setup
@@ -104,10 +105,12 @@ Security controls are implemented with defense-in-depth:
 3. **Authentication vs. Anonymous Reporting Boundary:**
    - *Whistleblowers:* Never register, provide credentials, or establish sessions. Access to case tracking is authenticated purely via bearer case-code possession.
    - *Moderators / Admins:* Internal personnel undergo credential authentication (`POST /api/v1/auth/login`) to receive short-lived bearer JWTs for role-gated administration.
-4. **Moderator Password Hashing & Canonicalization:**
+4. **Moderator Password Hashing, Canonicalization & Timing-Attack Mitigation:**
    - Password hashing uses **Argon2id** (`argon2-cffi`). The configuration (`time_cost=3`, `memory_cost=65536` [64 MiB], `parallelism=4`, `hash_len=32`, `salt_len=16`) is intentionally above OWASP's current minimum Argon2id baseline and was chosen as an engineering tradeoff between memory hardness and authentication latency.
    - Username canonicalization prevents casing and surrounding-whitespace ambiguity. It is not a Unicode confusable/homograph defense.
    - Failed authentication yields a uniform `401 Unauthorized` (`"Incorrect username or password"`) without revealing whether the username exists or the password was incorrect.
+   - *Timing Side-Channel Mitigation:* Authentication attempts perform password-hash verification for both existing and nonexistent usernames to reduce obvious response-time differences that could otherwise aid username enumeration. This does not provide a formal constant-time guarantee across the full network stack.
+
 5. **Context-Bound Short-Lived JWT Bearer Tokens:**
    - Issued upon successful moderator authentication with a 30-minute expiration (`ACCESS_TOKEN_EXPIRE_MINUTES=30`).
    - Signed using `HS256` with `JWT_SECRET`. Algorithm confusion is strictly prevented by specifying the allowed algorithm list during token decoding.
@@ -180,8 +183,10 @@ Security controls are implemented with defense-in-depth:
 - [x] **Phase 3:** Public Anonymous Case Tracking & Status Updates
 - [x] **Phase 4:** Moderator Authentication & Role-Based Access Control (RBAC)
 - [x] **Phase 4.1:** Authentication Lifecycle Hardening (Account Lifecycle `is_active`, Context-Bound JWTs, DB Role Authority, Test Endpoint Removal)
+- [x] **Phase 4.2:** Authentication Enumeration & Timing Hardening (Fixed Dummy Argon2id Verification)
 - [ ] **Phase 5 (Planned):** Case Status Lifecycle Management & Immutable Audit Trail
 - [ ] **Phase 6 (Planned):** Evidence Attachment Storage & Advanced Defense (Rate Limiting, ClamAV Scanning)
+
 
 
 

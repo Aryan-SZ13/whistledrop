@@ -21,6 +21,12 @@ _password_hasher = PasswordHasher(
     salt_len=16,
 )
 
+# Fixed dummy Argon2id password hash generated once at process initialization.
+# Computed from an unguessable 256-bit random string so it contains no real password.
+# Used during authentication of nonexistent users to perform comparable cryptographic
+# work and mitigate username-enumeration timing side channels.
+DUMMY_ARGON2_HASH: str = _password_hasher.hash(secrets.token_hex(32))
+
 
 def generate_case_code() -> str:
     """Generate a cryptographically secure, high-entropy bearer token for case tracking.

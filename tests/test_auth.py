@@ -5,11 +5,13 @@ from fastapi import HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
 import jwt
 import pytest
+import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_moderator, require_admin, require_moderator
 from app.core.config import settings
 from app.core.security import (
+    DUMMY_ARGON2_HASH,
     create_access_token,
     decode_access_token,
     hash_password,
@@ -19,6 +21,7 @@ from app.core.security import (
 from app.models.enums import ModeratorRole
 from app.models.moderator import Moderator
 from app.services.auth_service import auth_service
+
 
 
 # ==============================================================================
@@ -529,3 +532,159 @@ def test_removed_test_admin_endpoint_returns_404(client):
     """Verify temporary dev endpoint /api/v1/auth/test-admin is removed and returns 404."""
     response = client.get("/api/v1/auth/test-admin")
     assert response.status_code == 404
+
+
+# ==============================================================================
+# Unit & Integration Tests: Username Enumeration / Timing Hardening
+# ==============================================================================
+
+def test_dummy_argon2_hash_properties():
+    """Verify DUMMY_ARGON2_HASH is a valid Argon2id hash with expected configuration."""
+    assert isinstance(DUMMY_ARGON2_HASH, str)
+    assert DUMMY_ARGON2_HASH.startswith("$argon2id$")
+    assert "m=65536,t=3,p=4" in DUMMY_ARGON2_HASH
+
+    # Verification must fail for any candidate password
+    assert verify_password("CorrectHorseBatteryStaple123!", DUMMY_ARGON2_HASH) is False
+    assert verify_password("", DUMMY_ARGON2_HASH) is False
+    assert verify_password("dummy_password", DUMMY_ARGON2_HASH) is False
+
+
+@pytest.mark.asyncio
+async def test_dummy_hash_not_stored_in_database(db_session: AsyncSession):
+    """Verify DUMMY_ARGON2_HASH is never stored in the PostgreSQL database."""
+    # Create several real moderators
+    await auth_service.create_moderator(db_session, "user1", "Pass1!", ModeratorRole.MODERATOR)
+    await auth_service.create_moderator(db_session, "user2", "Pass2!", ModeratorRole.ADMIN)
+
+    # Query all password hashes in the database
+    stmt = sa.select(Moderator.password_hash)
+    result = await db_session.execute(stmt)
+    hashes_in_db = result.scalars().all()
+
+    assert DUMMY_ARGON2_HASH not in hashes_in_db
+
+    # Also directly verify count where password_hash equals dummy hash is zero
+    count_stmt = sa.select(sa.func.count(Moderator.id)).where(Moderator.password_hash == DUMMY_ARGON2_HASH)
+    res_count = await db_session.execute(count_stmt)
+    assert res_count.scalar() == 0
+
+
+@pytest.mark.asyncio
+async def test_nonexistent_user_invokes_dummy_password_verification(client, monkeypatch):
+    """Verify nonexistent user login executes password verification with DUMMY_ARGON2_HASH."""
+    captured_calls = []
+
+    def spy_verify_password(plain: str, hashed: str) -> bool:
+        captured_calls.append((plain, hashed))
+        return False
+
+    monkeypatch.setattr("app.core.security.verify_password", spy_verify_password)
+
+    response = client.post(
+        "/api/v1/auth/login",
+        json={"username": "ghost_user", "password": "SamplePassword123!"},
+    )
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Incorrect username or password"}
+
+    # Assert verify_password was invoked exactly once with dummy hash
+    assert len(captured_calls) == 1
+    plain_used, hash_used = captured_calls[0]
+    assert plain_used == "SamplePassword123!"
+    assert hash_used == DUMMY_ARGON2_HASH
+
+
+@pytest.mark.asyncio
+async def test_existing_user_wrong_password_invokes_real_password_verification(
+    client,
+    db_session: AsyncSession,
+    monkeypatch,
+):
+    """Verify existing user login executes password verification with stored hash."""
+    mod = await auth_service.create_moderator(
+        db_session,
+        username="existing_alice",
+        password="RealPassword123!",
+        role=ModeratorRole.MODERATOR,
+    )
+
+    captured_calls = []
+
+    def spy_verify_password(plain: str, hashed: str) -> bool:
+        captured_calls.append((plain, hashed))
+        return False
+
+    monkeypatch.setattr("app.core.security.verify_password", spy_verify_password)
+
+
+    response = client.post(
+        "/api/v1/auth/login",
+        json={"username": "existing_alice", "password": "WrongPassword!"},
+    )
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Incorrect username or password"}
+
+    # Assert verify_password was invoked with the user's real stored password hash
+    assert len(captured_calls) == 1
+    plain_used, hash_used = captured_calls[0]
+    assert plain_used == "WrongPassword!"
+    assert hash_used == mod.password_hash
+    assert hash_used != DUMMY_ARGON2_HASH
+
+
+@pytest.mark.asyncio
+async def test_identical_status_and_body_for_nonexistent_and_wrong_password(
+    client,
+    db_session: AsyncSession,
+):
+    """Verify nonexistent user and wrong password return identical HTTP status, headers, and body."""
+    await auth_service.create_moderator(
+        db_session,
+        username="known_user",
+        password="CorrectPassword123!",
+        role=ModeratorRole.MODERATOR,
+    )
+
+    # 1. Nonexistent user
+    res_nonexistent = client.post(
+        "/api/v1/auth/login",
+        json={"username": "unknown_user", "password": "SomePassword123!"},
+    )
+
+    # 2. Existing user with wrong password
+    res_wrong_pw = client.post(
+        "/api/v1/auth/login",
+        json={"username": "known_user", "password": "WrongPassword123!"},
+    )
+
+    # Assert status code equality
+    assert res_nonexistent.status_code == 401
+    assert res_wrong_pw.status_code == 401
+
+    # Assert response payload equality
+    assert res_nonexistent.json() == res_wrong_pw.json()
+    assert res_nonexistent.json() == {"detail": "Incorrect username or password"}
+
+    # Assert WWW-Authenticate header equality
+    assert res_nonexistent.headers.get("www-authenticate") == res_wrong_pw.headers.get("www-authenticate")
+
+
+@pytest.mark.asyncio
+async def test_dummy_hash_and_password_not_exposed_in_logs(client, caplog):
+    """Verify DUMMY_ARGON2_HASH, passwords, and secrets are never logged during nonexistent logins."""
+    with caplog.at_level(logging.DEBUG):
+        response = client.post(
+            "/api/v1/auth/login",
+            json={"username": "nonexistent_probe", "password": "CandidatePassword999!"},
+        )
+        assert response.status_code == 401
+
+        logged_content = caplog.text
+        assert "CandidatePassword999!" not in logged_content
+        assert DUMMY_ARGON2_HASH not in logged_content
+        assert settings.JWT_SECRET not in logged_content
+        assert settings.CASE_CODE_SECRET not in logged_content
+
