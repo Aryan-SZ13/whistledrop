@@ -13,7 +13,7 @@ whistledrop/
 ├── .env.example              # Template for environment configuration & secrets
 ├── .gitignore                # Git ignore rules for virtual environments, secrets, caches
 ├── alembic.ini               # Alembic database migration configuration
-├── docker-compose.yml        # Development PostgreSQL database container
+├── docker-compose.yml        # Development PostgreSQL and Redis service containers
 ├── requirements.txt          # Reproducible, pinned Python dependencies
 ├── README.md                 # Architecture, privacy/security models, and setup guide
 ├── alembic/
@@ -22,31 +22,34 @@ whistledrop/
 │   └── versions/             # Versioned schema migrations
 ├── app/
 │   ├── __init__.py           # Package marker with application version
-│   ├── main.py               # FastAPI entrypoint, middleware, and route mounting
+│   ├── main.py               # FastAPI entrypoint, lifespan, CORS, and route mounting
 │   ├── core/
 │   │   ├── __init__.py
+│   │   ├── client_ip.py      # Socket-peer trust verification and IP normalization
 │   │   ├── config.py         # Type-safe settings, secret validation, environment logic
 │   │   └── security.py       # Argon2id password hashing, JWT tokens, CSPRNG case-codes
 │   ├── db/
 │   │   ├── __init__.py
+│   │   ├── redis.py          # Asynchronous Redis client lifecycle and pool management
 │   │   └── session.py        # Async engine, sessionmaker, and get_db dependency
 │   ├── models/
 │   │   ├── __init__.py       # Model exports
 │   │   ├── base.py           # DeclarativeBase base model class
-│   │   ├── enums.py          # Domain enums (ReportCategory, ReportStatus, ModeratorRole)
+│   │   ├── enums.py          # Domain enums (ReportCategory, ReportStatus, ModeratorRole, ReportUpdateType)
 │   │   ├── moderator.py      # Moderator accounts and roles
 │   │   ├── report.py         # Core whistleblower report schema
-│   │   ├── report_update.py  # Moderator case status updates
+│   │   ├── report_update.py  # Moderator case status updates and internal notes
 │   │   └── audit_log.py      # Action audit logs
 │   ├── schemas/
 │   │   ├── __init__.py       # Pydantic schemas export
 │   │   ├── auth.py           # Moderator login and token schemas
-│   │   ├── moderator.py      # Moderator report listing and inspection schemas
+│   │   ├── moderator.py      # Moderator report listing, status update, and note schemas
 │   │   └── report.py         # Public request and response schemas
 │   ├── services/
 │   │   ├── __init__.py       # Services export
 │   │   ├── auth_service.py   # Moderator authentication, hashing, and token issuance
-│   │   ├── moderator_service.py # Protected report querying, filtering, and inspection
+│   │   ├── moderator_service.py # Protected report querying, filtering, and status transitions
+│   │   ├── rate_limiter.py   # Redis sliding-window rate limiter with atomic Lua scripts
 │   │   └── report_service.py # Core business logic for report submission and tracking
 │   └── api/
 │       ├── __init__.py
@@ -56,18 +59,19 @@ whistledrop/
 │           ├── api.py        # API router aggregator
 │           └── endpoints/
 │               ├── __init__.py
-│               ├── auth.py   # Moderator authentication endpoints
+│               ├── auth.py   # Moderator authentication endpoints (rate limited)
 │               ├── health.py # Health check probe endpoint
 │               ├── moderator.py # Protected moderator report management routes
-│               └── reports.py# Anonymous report submission & tracking endpoints
+│               └── reports.py# Anonymous report submission & tracking endpoints (rate limited)
 └── tests/
     ├── __init__.py
-    ├── conftest.py           # Test database fixtures, isolation, and async session setup
+    ├── conftest.py           # Test database & Redis fixtures, isolation, and session setup
     ├── test_auth.py          # Argon2id, JWT lifecycle, RBAC, and login tests
     ├── test_config.py        # Configuration, CORS, and secret validation tests
     ├── test_database.py      # Database models, constraints, enums, and schema tests
     ├── test_health.py        # Health and root endpoint tests
-    ├── test_moderator.py     # Protected moderator control plane tests
+    ├── test_moderator.py     # Protected moderator control plane & lifecycle tests
+    ├── test_rate_limiting.py # Sliding-window rate limiting, privacy, proxy, and outage tests
     ├── test_reports.py       # Report creation, validation, and crypto regression tests
     └── test_tracking.py      # Public case tracking, isolation, and minimization tests
 ```
@@ -179,11 +183,96 @@ Security controls are implemented with defense-in-depth:
 
 | Threat | Target / Impact | Mitigation Strategy |
 | :--- | :--- | :--- |
-| **Case-Code Enumeration / Brute Force** | Adversaries guessing case codes to view confidential reports. | High-entropy CSPRNG tokens, non-sequential codes, keyed HMAC/salted one-way digests (`CASE_CODE_SECRET`), and upcoming per-IP / global rate limiting. |
+| Threat | Target / Impact | Mitigation Strategy |
+| :--- | :--- | :--- |
+| **Case-Code Enumeration / Brute Force** | Adversaries guessing case codes to view confidential reports. | High-entropy CSPRNG tokens (192 bits), keyed HMAC digests (`CASE_CODE_SECRET`), per-client sliding window rate limiting, and atomic global safeguard limiting. |
 | **Traffic Correlation / Metadata Leakage** | Correlating report submissions with network traffic or server logs. | Application models and application logs omit submitter identity and network metadata; infrastructure ingress proxies must be configured to discard or anonymize access logs. |
-| **Cross-Domain Secret Compromise** | Compromise of moderator JWT secrets impacting report access. | Cryptographic secret separation; `JWT_SECRET` and `CASE_CODE_SECRET` are independent keys validated to never share values. |
+| **Cross-Domain Secret Compromise** | Compromise of one cryptographic secret impacting other security contexts. | Three-way cryptographic secret separation; `JWT_SECRET`, `CASE_CODE_SECRET`, and `RATE_LIMIT_KEY_SECRET` are independent keys validated to never share values. |
 | **API Schema Reconnaissance** | Attackers scanning interactive API documentation to map out endpoints and attack vectors. | Automatic suppression of Swagger UI (`/docs`), ReDoc (`/redoc`), and OpenAPI schema (`/openapi.json`) when `DEBUG=False` in production. |
 | **Unauthorized Moderator Access** | Malicious actors accessing case management records. | Argon2id password hashing, canonical username normalization, active account verification (`is_active`), Role-Based Access Control (RBAC), context-bound JWTs, and structured audit logs. |
+| **Automated Credential Spraying** | Rapid brute-force attacks against moderator login. | Sliding window rate limiting (5 req / 5 min), dummy Argon2id timing equalization, and fail-closed service protection. |
+| **Request Flooding / Denial of Service** | Flooding anonymous submission endpoints to exhaust storage. | Ephemeral sliding window rate limiting (5 req / 5 min per client bucket) with atomic Lua evaluation. |
+
+---
+
+## Abuse Resistance & Rate Limiting (Phase 7)
+
+WhistleDrop enforces an abuse-resistance layer backed by Redis 7 and atomic Lua scripts. It protects sensitive public and authenticated endpoints while preserving the privacy guarantees of the anonymous reporting model.
+
+### 1. Redis Ephemeral State vs. PostgreSQL Persistence
+
+| Characteristic | PostgreSQL | Redis |
+| :--- | :--- | :--- |
+| **Purpose** | Persistent business data: reports, audit logs, accounts | Ephemeral abuse-control counters and windows |
+| **Retention** | Long-term durable storage | Bounded TTLs (60 to 300 seconds) |
+| **Client Identity** | NEVER persisted (no IP, User-Agent, or fingerprint columns) | Stored ONLY as 16-hex keyed HMAC-SHA256 buckets |
+| **Failure Mode** | Transactional ACID rollback | Fail-closed (HTTP 503) on Redis outage |
+
+### 2. Endpoint Policies & Defaults
+
+| Endpoint | Method | Scope | Default Limit | Window | Key Format |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `/api/v1/reports` | `POST` | Per-Client | 5 requests | 300s (5m) | `rl:v1:submit:<bucket>` |
+| `/api/v1/reports/{case_code}` | `GET` | Per-Client | 10 requests | 60s (1m) | `rl:v1:lookup:<bucket>` |
+| `/api/v1/reports/{case_code}` | `GET` | System Global | 100 requests | 60s (1m) | `rl:v1:lookup_global:all` |
+| `/api/v1/auth/login` | `POST` | Per-Client | 5 requests | 300s (5m) | `rl:v1:login:<bucket>` |
+
+All thresholds and window durations are configurable via environment variables (`SUBMISSION_RATE_LIMIT`, `LOOKUP_RATE_LIMIT`, `LOOKUP_GLOBAL_RATE_LIMIT`, `LOGIN_RATE_LIMIT`, etc.).
+
+### 3. Client-Bucket Privacy Model
+
+To prevent exposing raw IP addresses or creating rainbow-table-reversible hashes in Redis:
+- Client identifiers are derived using **keyed HMAC-SHA256**:
+  $$\text{bucket} = \text{HMAC-SHA256}(\text{RATE\_LIMIT\_KEY\_SECRET}, \text{canonical\_client\_ip})[:16]$$
+- `RATE_LIMIT_KEY_SECRET` is a dedicated 256-bit secret, strictly separated from `JWT_SECRET` and `CASE_CODE_SECRET`.
+- Plaintext IP addresses, case codes, usernames, passwords, JWTs, and report bodies are **never placed in Redis keys or values**.
+- Rotating `RATE_LIMIT_KEY_SECRET` immediately invalidates all existing client buckets across the cluster.
+
+### 4. Atomic Lua Sliding-Window Algorithm
+
+Rate limiting is evaluated using Redis Sorted Sets (`ZSET`) inside an atomic Lua script executed via `EVALSHA`:
+1. Current server time is obtained directly from Redis (`TIME`) to eliminate application clock skew.
+2. Expired request entries older than the active window are removed via `ZREMRANGEBYSCORE`.
+3. The remaining active entries are counted via `ZCARD`.
+4. If count $\ge$ limit:
+   - The request is **rejected without consuming quota** (no `ZADD` is executed).
+   - `Retry-After` is calculated from the oldest surviving entry:
+     $$\text{retry\_after} = \lceil \text{oldest\_timestamp} + \text{window} - \text{now} \rceil \quad (\ge 1\,\text{sec})$$
+5. If count < limit:
+   - A unique member (`{now}-{random_hex}`) is inserted via `ZADD`.
+   - Key expiration is set to the window duration via `EXPIRE`.
+
+### 5. Multi-Policy Atomic Lookup Protection
+
+Case tracking (`GET /api/v1/reports/{case_code}`) evaluates **both** the client-scoped policy and the global safeguard policy in a **single atomic Lua invocation**:
+- If either policy rejects, **neither bucket receives an insertion**.
+- The `Retry-After` header returns the maximum required wait time:
+  $$\text{retry\_after} = \max(\text{client\_retry\_after}, \text{global\_retry\_after})$$
+- Case tracking never creates Redis keys based on guessed case codes. Probing 10,000 different codes from one IP consumes quota from the same single client bucket without ballooning Redis key cardinality.
+
+### 6. Trusted Proxy & Socket-Peer Trust Boundary
+
+- **Root of Trust:** The immediate TCP socket peer (`request.client.host`) is the sole trust anchor.
+- **Default Behavior:** When `TRUSTED_PROXY_COUNT = 0` or `TRUSTED_PROXY_CIDRS` is empty, `X-Forwarded-For` is completely ignored.
+- **Validated Proxy Ingress:** Only when the immediate socket peer belongs to a network in `TRUSTED_PROXY_CIDRS` does the application parse `X-Forwarded-For`.
+- **Right-to-Left Traversal:** The client address is extracted by skipping `TRUSTED_PROXY_COUNT` hops from right to left, preventing spoofed client headers.
+- **Canonicalization:** All addresses are normalized via Python `ipaddress` (canonicalizing IPv4 decimal strings and compressed IPv6 representations).
+
+### 7. Failure Mode (Fail-Closed) & Response Semantics
+
+- **Fail-Closed Strategy:** If Redis is down, unreachable, or times out, all protected endpoints return **HTTP 503 Service Unavailable** with `{"detail": "Rate limiting service unavailable"}`. Abuse controls are never silently bypassed.
+- **Error Minimization:** Internal Redis connection errors and stack traces are suppressed and never leak to the client.
+- **HTTP 429 Responses:** Rate-limited responses return:
+  ```http
+  HTTP/1.1 429 Too Many Requests
+  Retry-After: 42
+  Content-Type: application/json
+
+  {
+      "detail": "Too many requests"
+  }
+  ```
+  Internal counters, current usage, and policy rules are omitted from response bodies.
 
 ---
 
@@ -200,11 +289,9 @@ Security controls are implemented with defense-in-depth:
 - [x] **Phase 5:** Protected Moderator Control Plane (Report Listing, Filtering, Bounded Pagination, and Detail Inspection)
 - [x] **Phase 5.1:** Moderator Query Least-Privilege Hardening (Explicit SQL Column Projections)
 - [x] **Phase 6:** Case Lifecycle State Machine, Public/Internal Update Separation, and Auditing
-- [ ] **Phase 7 (Planned):** Evidence Attachment Storage & Advanced Defense (Rate Limiting, ClamAV Scanning)
-
-
-
-
+- [x] **Phase 6.1:** Least-Privilege Moderator Update Query Hardening
+- [x] **Phase 7:** Redis-Backed Abuse Resistance & Sliding-Window Rate Limiting
+- [ ] **Phase 8 (Planned):** Evidence Attachment Storage & Antivirus Scanning (ClamAV)
 
 ---
 
@@ -213,7 +300,8 @@ Security controls are implemented with defense-in-depth:
 ### 1. Prerequisites
 
 - Python 3.10+ (Python 3.13 tested)
-- PostgreSQL 16 (local installation or via Docker Compose)
+- PostgreSQL 16
+- Redis 7+
 
 ### 2. Environment Setup
 

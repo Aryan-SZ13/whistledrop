@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 import pytest
 import sqlalchemy as sa
@@ -60,15 +61,18 @@ async def test_tracking_with_chronological_updates(
     await db_session.flush()
 
     # 2. Add two updates to the report with different timestamps
+    now = datetime.now(timezone.utc)
     u1 = ReportUpdate(
         report_id=report.id,
         created_by=mod.id,
         message="Initial assessment opened by security team.",
+        created_at=now - timedelta(minutes=5),
     )
     u2 = ReportUpdate(
         report_id=report.id,
         created_by=mod.id,
         message="Vulnerability patched and pending verification.",
+        created_at=now,
     )
     db_session.add_all([u1, u2])
     await db_session.commit()

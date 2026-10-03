@@ -20,3 +20,7 @@ pyjwt==2.15.1
 httpx==0.28.1
 pytest==9.1.1
 pytest-asyncio==1.4.0
+
+# Rate Limiting & Abuse Resistance (Async Redis Client)
+redis[hiredis]>=5.0.0
+

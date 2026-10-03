@@ -38,13 +38,34 @@ def test_cors_json_array_parsing():
 
 
 def test_secret_reuse_rejection():
-    """Verify that reusing the same secret for JWT and case codes is strictly rejected."""
+    """Verify that reusing secrets between JWT, case codes, and rate limiting is strictly rejected."""
+    # JWT and CASE_CODE secret reuse
     with pytest.raises(ValidationError) as exc_info:
         Settings(
             JWT_SECRET="shared-secret-that-must-never-be-reused-between-contexts",
             CASE_CODE_SECRET="shared-secret-that-must-never-be-reused-between-contexts",
+            RATE_LIMIT_KEY_SECRET="unique-rate-limit-secret-key-min32-characters",
         )
     assert "distinct secrets" in str(exc_info.value)
+
+    # JWT and RATE_LIMIT secret reuse
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(
+            JWT_SECRET="shared-secret-that-must-never-be-reused-between-contexts",
+            CASE_CODE_SECRET="unique-case-code-secret-key-min32-characters",
+            RATE_LIMIT_KEY_SECRET="shared-secret-that-must-never-be-reused-between-contexts",
+        )
+    assert "distinct secrets" in str(exc_info.value)
+
+    # CASE_CODE and RATE_LIMIT secret reuse
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(
+            JWT_SECRET="unique-jwt-secret-key-min32-characters",
+            CASE_CODE_SECRET="shared-secret-that-must-never-be-reused-between-contexts",
+            RATE_LIMIT_KEY_SECRET="shared-secret-that-must-never-be-reused-between-contexts",
+        )
+    assert "distinct secrets" in str(exc_info.value)
+
 
 
 def test_production_rejects_debug_true():
@@ -87,8 +108,10 @@ def test_production_valid_defaults():
         ENV="production",
         JWT_SECRET="a-very-secure-unique-production-jwt-secret-min32-chars",
         CASE_CODE_SECRET="a-very-secure-unique-production-case-code-secret-min32-chars",
+        RATE_LIMIT_KEY_SECRET="a-very-secure-unique-production-rate-limit-secret-min32",
     )
     assert cfg.ENV == "production"
     assert cfg.DEBUG is False
     # Restrictive CORS: empty by default in production unless explicitly set
     assert cfg.BACKEND_CORS_ORIGINS == []
+

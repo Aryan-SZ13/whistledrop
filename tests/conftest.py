@@ -39,6 +39,24 @@ async def clean_database():
         )
 
 
+@pytest_asyncio.fixture(autouse=True)
+async def clean_redis():
+    """Ensure complete Redis key isolation between tests."""
+    from app.db.redis import get_redis
+    try:
+        r = get_redis()
+        await r.flushdb()
+    except Exception:
+        pass
+    yield
+    try:
+        r = get_redis()
+        await r.flushdb()
+    except Exception:
+        pass
+
+
+
 @pytest_asyncio.fixture
 async def db_session() -> AsyncGenerator[AsyncSession, None]:
     """Provides an isolated database session that supports explicit commits."""

@@ -4,8 +4,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 DEV_INSECURE_JWT_SECRET = "dev-insecure-jwt-secret-key-change-in-production-min32bytes"
 DEV_INSECURE_CASE_CODE_SECRET = "dev-insecure-case-code-secret-key-change-in-production-min32bytes"
+DEV_INSECURE_RATE_LIMIT_KEY_SECRET = "dev-insecure-rate-limit-key-secret-change-in-production-min32"
 ENV_EXAMPLE_PLACEHOLDER_JWT = "replace-with-a-secure-random-secret-for-jwt-tokens-minimum-32-chars"
 ENV_EXAMPLE_PLACEHOLDER_CASE = "replace-with-a-secure-random-secret-for-case-codes-minimum-32-chars"
+ENV_EXAMPLE_PLACEHOLDER_RATE_LIMIT = "replace-with-a-secure-random-secret-for-rate-limit-keys-min-32"
 
 DEFAULT_DEV_CORS_ORIGINS: List[str] = [
     "http://localhost:3000",
@@ -26,11 +28,31 @@ class Settings(BaseSettings):
     # Distinct Cryptographic Secrets & JWT Configuration
     JWT_SECRET: str = DEV_INSECURE_JWT_SECRET
     CASE_CODE_SECRET: str = DEV_INSECURE_CASE_CODE_SECRET
+    RATE_LIMIT_KEY_SECRET: str = DEV_INSECURE_RATE_LIMIT_KEY_SECRET
     JWT_ALGORITHM: str = "HS256"
     JWT_ISSUER: str = "whistledrop-api"
     JWT_AUDIENCE: str = "whistledrop-moderators"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
 
+    # Redis Configuration (Ephemeral Rate Limiting & Abuse Resistance)
+    REDIS_URL: str = "redis://localhost:6379/0"
+
+    # Trusted Proxy Configuration
+    TRUSTED_PROXY_CIDRS: str = ""
+    TRUSTED_PROXY_COUNT: int = 0
+
+    # Rate Limiting Policies (Configurable limits and window durations in seconds)
+    SUBMISSION_RATE_LIMIT: int = 5
+    SUBMISSION_RATE_WINDOW_SECONDS: int = 300
+
+    LOOKUP_RATE_LIMIT: int = 10
+    LOOKUP_RATE_WINDOW_SECONDS: int = 60
+
+    LOOKUP_GLOBAL_RATE_LIMIT: int = 100
+    LOOKUP_GLOBAL_RATE_WINDOW_SECONDS: int = 60
+
+    LOGIN_RATE_LIMIT: int = 5
+    LOGIN_RATE_WINDOW_SECONDS: int = 300
 
     # Configurable CORS Origins
     BACKEND_CORS_ORIGINS: Union[List[str], str] = []
@@ -84,9 +106,10 @@ class Settings(BaseSettings):
                 self.DEBUG = True
 
         # 2. Secret Separation & Non-Reuse Verification
-        if self.JWT_SECRET == self.CASE_CODE_SECRET:
+        secrets_set = {self.JWT_SECRET, self.CASE_CODE_SECRET, self.RATE_LIMIT_KEY_SECRET}
+        if len(secrets_set) < 3:
             raise ValueError(
-                "JWT_SECRET and CASE_CODE_SECRET must be distinct secrets. "
+                "JWT_SECRET, CASE_CODE_SECRET, and RATE_LIMIT_KEY_SECRET must be distinct secrets. "
                 "Do NOT reuse the same secret across different security contexts."
             )
 
@@ -95,8 +118,10 @@ class Settings(BaseSettings):
             insecure_placeholders = {
                 DEV_INSECURE_JWT_SECRET,
                 DEV_INSECURE_CASE_CODE_SECRET,
+                DEV_INSECURE_RATE_LIMIT_KEY_SECRET,
                 ENV_EXAMPLE_PLACEHOLDER_JWT,
                 ENV_EXAMPLE_PLACEHOLDER_CASE,
+                ENV_EXAMPLE_PLACEHOLDER_RATE_LIMIT,
             }
             if self.JWT_SECRET in insecure_placeholders or len(self.JWT_SECRET) < 32:
                 raise ValueError(
@@ -105,6 +130,10 @@ class Settings(BaseSettings):
             if self.CASE_CODE_SECRET in insecure_placeholders or len(self.CASE_CODE_SECRET) < 32:
                 raise ValueError(
                     "Production requires a strong, unique CASE_CODE_SECRET of at least 32 characters."
+                )
+            if self.RATE_LIMIT_KEY_SECRET in insecure_placeholders or len(self.RATE_LIMIT_KEY_SECRET) < 32:
+                raise ValueError(
+                    "Production requires a strong, unique RATE_LIMIT_KEY_SECRET of at least 32 characters."
                 )
 
         # 4. CORS Behavior
