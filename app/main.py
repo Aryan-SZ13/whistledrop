@@ -19,12 +19,13 @@ app = FastAPI(
 
 # Configurable CORS Middleware
 # Only register middleware if allowed origins are explicitly defined.
-# Replaces permissive allow_origins=["*"] wildcard with configurable, environment-aware origin lists.
+# allow_credentials=False is enforced because authentication uses Bearer JWT headers,
+# eliminating the need for browser-managed credential exposure.
 if settings.BACKEND_CORS_ORIGINS:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.BACKEND_CORS_ORIGINS,
-        allow_credentials=True,
+        allow_credentials=False,
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type", "Accept"],
     )

@@ -6,10 +6,13 @@ uvicorn[standard]==0.54.0
 pydantic==2.13.5
 pydantic-settings==2.15.0
 
-# Database (Async SQLAlchemy & PostgreSQL driver - Option A)
+# Database & Migrations (Async SQLAlchemy & PostgreSQL driver)
 sqlalchemy==2.1.3
 asyncpg==0.31.0
+alembic==1.14.0
+greenlet==3.5.6
 
 # Testing & HTTP Client
 httpx==0.28.1
 pytest==9.1.1
+pytest-asyncio==1.4.0

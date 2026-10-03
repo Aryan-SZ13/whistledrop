@@ -33,14 +33,15 @@ def test_api_v1_health_endpoint():
 
 
 def test_cors_headers_allowed_origin():
-    """Verify that requests from an allowed origin receive CORS headers."""
+    """Verify that requests from an allowed origin receive CORS headers without credentials."""
     response = client.get(
         "/health",
         headers={"Origin": "http://localhost:3000"},
     )
     assert response.status_code == 200
     assert response.headers.get("access-control-allow-origin") == "http://localhost:3000"
-    assert response.headers.get("access-control-allow-credentials") == "true"
+    # With Bearer token auth, allow_credentials is False so header is not present
+    assert response.headers.get("access-control-allow-credentials") is None
 
 
 def test_cors_headers_unallowed_origin():
