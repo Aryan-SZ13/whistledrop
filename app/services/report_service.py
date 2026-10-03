@@ -22,8 +22,8 @@ class ReportService:
         """Create a new anonymous report atomically within a database transaction.
 
         Flow:
-        1. Generate a high-entropy CSPRNG case code.
-        2. Compute HMAC-SHA256 digest using CASE_CODE_SECRET.
+        1. Generate a high-entropy case code using CSPRNG.
+        2. Derive HMAC-SHA256 digest using CASE_CODE_SECRET.
         3. Persist the Report model record with status SUBMITTED (storing only digest).
         4. Persist an AuditLog record (excluding case code, description, and client metadata).
         5. Atomically commit the transaction.
@@ -32,7 +32,7 @@ class ReportService:
         Returns:
             Tuple[Report, str]: The persisted report model and the plaintext case code.
         """
-        # 1. Cryptographically secure case code generation
+        # 1. Generate case code using cryptographically secure RNG
         case_code = generate_case_code()
 
         # 2. Derive HMAC digest using CASE_CODE_SECRET
@@ -40,15 +40,16 @@ class ReportService:
 
         try:
             # 3. Create Report model instance (only storing digest, never plaintext case code)
+            evidence_url_str = str(report_in.evidence_url) if report_in.evidence_url else None
             report = Report(
                 case_code_digest=case_code_digest,
                 category=report_in.category,
                 description=report_in.description,
-                evidence_url=report_in.evidence_url,
+                evidence_url=evidence_url_str,
                 status=ReportStatus.SUBMITTED,
             )
             db.add(report)
-            await db.flush()  # Populates report.id for audit log linkage
+            await db.flush()  # Populates report.id for internal audit log linkage
 
             # 4. Create safe audit log entry (no case codes, digests, descriptions, or PII)
             audit_log = AuditLog(
@@ -66,8 +67,9 @@ class ReportService:
             await db.commit()
             await db.refresh(report)
 
-            # 6. Safe logging: log ONLY non-sensitive operational identifiers
-            logger.info("Report submitted successfully: report_id=%s category=%s", report.id, report.category.value)
+            # 6. Minimal operational logging: log ONLY high-level category count/status.
+            # NEVER log case codes, digests, descriptions, evidence URLs, or auth tokens.
+            logger.info("Report submitted successfully: category=%s", report.category.value)
 
             return report, case_code
 

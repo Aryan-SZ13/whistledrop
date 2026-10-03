@@ -15,7 +15,8 @@ router = APIRouter()
     summary="Submit anonymous report",
     description=(
         "Submit an anonymous whistleblower incident report. "
-        "Returns a unique case code (bearer credential) shown only once for status tracking."
+        "Returns a unique case code (bearer credential) shown only once for status tracking. "
+        "Internal database identifiers are not exposed."
     ),
 )
 async def submit_report(
@@ -25,7 +26,6 @@ async def submit_report(
     """Endpoint for anonymous report ingestion."""
     report, case_code = await report_service.create_report(db=db, report_in=report_in)
     return ReportCreateResponse(
-        id=report.id,
         case_code=case_code,
         status=report.status,
         created_at=report.created_at,

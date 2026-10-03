@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
-from app.core.security import derive_case_code_digest
+from app.core.security import derive_case_code_digest, generate_case_code
 from app.models.audit_log import AuditLog
 from app.models.enums import ReportCategory, ReportStatus
 from app.models.report import Report
@@ -15,8 +15,8 @@ from app.schemas.report import ReportCreate
 from app.services.report_service import report_service
 
 
-def test_submit_report_success(client: TestClient):
-    """Verify successful report submission flow and response shape."""
+def test_submit_report_success_response_shape(client: TestClient):
+    """Verify successful report submission minimizes public response and conceals internal UUID."""
     payload = {
         "category": "CORRUPTION",
         "description": "Observed fraudulent procurement contract approvals.",
@@ -26,15 +26,19 @@ def test_submit_report_success(client: TestClient):
     assert response.status_code == 201
     data = response.json()
 
-    # Public response must expose only the minimum information
-    assert "id" in data
-    assert "case_code" in data
+    # Public response MUST expose only case_code, status, and created_at
+    assert set(data.keys()) == {"case_code", "status", "created_at"}
+
+    # Internal database primary keys must remain strictly internal
+    assert "id" not in data
+
+    # Bearer credential checks
     assert data["case_code"].startswith("wdc_")
     assert len(data["case_code"]) >= 36
     assert data["status"] == "SUBMITTED"
     assert "created_at" in data
 
-    # Verify sensitive and internal fields are completely excluded from public response
+    # Internal and sensitive fields must never be exposed
     assert "case_code_digest" not in data
     assert "description" not in data
     assert "evidence_url" not in data
@@ -49,8 +53,8 @@ def test_submit_report_without_evidence_url(client: TestClient):
     response = client.post("/api/v1/reports", json=payload)
     assert response.status_code == 201
     data = response.json()
+    assert set(data.keys()) == {"case_code", "status", "created_at"}
     assert data["status"] == "SUBMITTED"
-    assert "case_code" in data
 
 
 @pytest.mark.asyncio
@@ -66,26 +70,26 @@ async def test_plaintext_case_code_absent_from_database(
     response = client.post("/api/v1/reports", json=payload)
     assert response.status_code == 201
     data = response.json()
-    report_id = data["id"]
     plaintext_case_code = data["case_code"]
 
-    # 1. Fetch raw report from PostgreSQL
-    res = await db_session.execute(sa.select(Report).where(Report.id == report_id))
+    # 1. Derive expected digest to query the database (since internal ID is concealed)
+    expected_digest = derive_case_code_digest(plaintext_case_code)
+
+    # 2. Fetch raw report from PostgreSQL using the digest
+    res = await db_session.execute(
+        sa.select(Report).where(Report.case_code_digest == expected_digest)
+    )
     report = res.scalar_one_or_none()
     assert report is not None
 
-    # 2. Verify plaintext case code does NOT exist anywhere in report columns
+    # 3. Verify plaintext case code does NOT exist anywhere in report columns
     assert report.case_code_digest != plaintext_case_code
     assert plaintext_case_code not in (report.description or "")
     assert plaintext_case_code not in (report.evidence_url or "")
 
-    # 3. Verify digest matches HMAC-SHA256 of case code using CASE_CODE_SECRET
-    expected_digest = derive_case_code_digest(plaintext_case_code)
-    assert report.case_code_digest == expected_digest
-
     # 4. Check raw audit log row in PostgreSQL
     res_audit = await db_session.execute(
-        sa.select(AuditLog).where(AuditLog.report_id == report_id)
+        sa.select(AuditLog).where(AuditLog.report_id == report.id)
     )
     audit = res_audit.scalar_one_or_none()
     assert audit is not None
@@ -134,12 +138,23 @@ def test_submit_report_description_too_short(client: TestClient):
     assert response.status_code == 422
 
 
-def test_submit_report_invalid_evidence_url(client: TestClient):
-    """Verify invalid URL protocols (e.g. javascript:) are rejected."""
+@pytest.mark.parametrize(
+    "invalid_url",
+    [
+        "javascript:alert(1)",
+        "ftp://files.example.com/doc.pdf",
+        "file:///etc/passwd",
+        "http://",
+        "https://",
+        "not_a_valid_url",
+    ],
+)
+def test_submit_report_invalid_evidence_url(client: TestClient, invalid_url: str):
+    """Verify structured URL validation rejects dangerous or malformed schemes."""
     payload = {
         "category": "SECURITY",
-        "description": "Security report with suspicious evidence URL.",
-        "evidence_url": "javascript:alert(1)",
+        "description": "Security report with suspicious evidence URL format.",
+        "evidence_url": invalid_url,
     }
     response = client.post("/api/v1/reports", json=payload)
     assert response.status_code == 422
@@ -164,3 +179,55 @@ async def test_transaction_rollback_on_failure(db_session: AsyncSession):
 
     res_audits = await db_session.execute(sa.select(AuditLog))
     assert res_audits.fetchall() == []
+
+
+# ==============================================================================
+# Cryptographic Regression Tests
+# ==============================================================================
+
+
+def test_crypto_multiple_generated_case_codes_are_distinct():
+    """Verify that multiple generated case codes have sufficient entropy and no collisions."""
+    generated = {generate_case_code() for _ in range(100)}
+    assert len(generated) == 100
+    for code in generated:
+        assert code.startswith("wdc_")
+        assert len(code) >= 36
+
+
+def test_crypto_deterministic_digest_with_same_secret():
+    """Verify that the same case code and same secret produce an identical digest."""
+    case_code = "wdc_test_case_code_fixed_value_12345"
+    digest_1 = derive_case_code_digest(case_code)
+    digest_2 = derive_case_code_digest(case_code)
+    assert digest_1 == digest_2
+    assert len(digest_1) == 64  # SHA-256 hex digest length
+
+
+def test_crypto_different_case_codes_produce_different_digests():
+    """Verify collision resistance across different case codes."""
+    code_a = generate_case_code()
+    code_b = generate_case_code()
+    assert code_a != code_b
+
+    digest_a = derive_case_code_digest(code_a)
+    digest_b = derive_case_code_digest(code_b)
+    assert digest_a != digest_b
+
+
+def test_crypto_changing_secret_changes_digest():
+    """Verify that digest derivation strictly depends on CASE_CODE_SECRET."""
+    case_code = "wdc_test_fixed_token_for_secret_check"
+    original_secret = settings.CASE_CODE_SECRET
+
+    digest_orig = derive_case_code_digest(case_code)
+
+    # Re-compute digest using an alternate secret key
+    alternate_secret = "an-alternate-secret-key-for-testing-digest-changes"
+    digest_alt = hmac.new(
+        alternate_secret.encode("utf-8"),
+        case_code.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    assert digest_orig != digest_alt

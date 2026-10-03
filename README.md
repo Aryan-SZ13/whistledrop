@@ -66,7 +66,12 @@ WhistleDrop is built around **privacy-first anonymous reporting**:
 
 1. **Decoupled Identity:** The application data model does not store reporter identity. Database schemas explicitly contain no columns for names, email addresses, phone numbers, account IDs, or submitter identifiers.
 2. **Application-Level Metadata Exclusion:** The application database models and application logs do not persist submitter IP addresses or User-Agent headers. (Note: infrastructure-level logging at reverse proxies, load balancers, or hosting providers depends on deployment configuration and must be hardened independently in production environments).
-3. **Case-Code Token Retrieval:** Submissions generate a high-entropy, cryptographically derived case code that acts as a bearer token. The database stores only a one-way cryptographic digest (`case_code_digest`). Whistleblowers use this case code to check status and read updates without creating accounts or revealing identity.
+3. **Case-Code Token Retrieval:** Submissions generate a high-entropy case code using a cryptographically secure pseudo-random number generator (CSPRNG). The server derives an HMAC-SHA256 one-way digest (`case_code_digest`) using `CASE_CODE_SECRET` for database storage. The usable plaintext case code is returned to the user only once and never stored in PostgreSQL or application logs. Whistleblowers use this case code to check status and read updates without creating accounts or revealing identity.
+4. **Application-Collected Identity vs. Voluntary Content Disclosure:**
+   - *Application-collected identity:* The application architecture strictly eliminates tracking, account association, IP storage, and client fingerprinting.
+   - *Voluntarily embedded content:* The platform cannot prevent reporters from voluntarily embedding identifying details within free-text report descriptions or metadata URLs (e.g., mentioning names, specific roles, or submitting URLs containing identifying usernames). Reporters should exercise caution regarding the text and external links they provide.
+5. **Timestamp Precision Tradeoff:**
+   - The report creation response includes the exact timezone-aware `created_at` timestamp. This is a deliberate current design choice to provide immediate confirmation and tracking fidelity. Future privacy hardening passes may evaluate timestamp coarse-graining (quantizing submission times to hour or day boundaries) to mitigate potential network traffic-correlation attacks.
 
 ---
 
@@ -76,16 +81,28 @@ Security controls are implemented with defense-in-depth:
 
 1. **Cryptographic Domain Separation:**
    - `JWT_SECRET`: Dedicated secret exclusively for signing and verifying moderator authentication tokens.
-   - `CASE_CODE_SECRET`: Dedicated secret exclusively used for case-code derivation and one-way hashing.
+   - `CASE_CODE_SECRET`: Dedicated secret exclusively used to derive HMAC digests from case codes.
    - *Strict Prohibition:* Configuration validation rejects setups that reuse the same secret across different security contexts.
 2. **Impact of Secret Compromise:**
    - **`JWT_SECRET` compromise:** An attacker could forge moderator authorization tokens and impersonate moderators.
    - **`CASE_CODE_SECRET` compromise:** An attacker cannot "decrypt" stored one-way case-code digests (as cryptographic digests are inherently non-reversible), but an attacker with database read access could perform offline dictionary or brute-force precomputation attacks against suspected candidate case codes.
-3. **Production-Hardened Defaults:**
+3. **Internal ID Concealment:**
+   - Internal database primary keys (UUIDs) remain strictly internal and are never exposed in public report submission responses.
+   - Public report ingestion response schema exposes only:
+     ```json
+     {
+       "case_code": "wdc_...",
+       "status": "SUBMITTED",
+       "created_at": "2026-10-03T16:20:00Z"
+     }
+     ```
+4. **Metadata-Only Evidence Handling:**
+   - Submitted `evidence_url` values are strictly validated via structured URL parsers and stored purely as text metadata. The server never makes outbound HTTP requests or fetches submitted URLs, eliminating Server-Side Request Forgery (SSRF) risks.
+5. **Production-Hardened Defaults:**
    - `DEBUG` is strictly enforced to `False` in production environments.
    - OpenAPI documentation endpoints (`/docs`, `/redoc`, `/openapi.json`) are disabled when `DEBUG=False` to prevent API schema reconnaissance.
    - Minimum entropy requirements (min 32 characters) and placeholder rejection are enforced for production secrets at application startup.
-4. **Restrictive CORS:**
+6. **Restrictive CORS:**
    - Permissive wildcard origins (`allow_origins=["*"]`) are prohibited.
    - `allow_credentials` is set to `False` by default because authentication uses `Authorization: Bearer <token>` headers rather than browser cookies.
    - In production, CORS defaults to an empty allowlist (enforcing strict browser Same-Origin Policy) unless explicit origins are configured.
