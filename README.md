@@ -41,10 +41,12 @@ whistledrop/
 │   ├── schemas/
 │   │   ├── __init__.py       # Pydantic schemas export
 │   │   ├── auth.py           # Moderator login and token schemas
+│   │   ├── moderator.py      # Moderator report listing and inspection schemas
 │   │   └── report.py         # Public request and response schemas
 │   ├── services/
 │   │   ├── __init__.py       # Services export
 │   │   ├── auth_service.py   # Moderator authentication, hashing, and token issuance
+│   │   ├── moderator_service.py # Protected report querying, filtering, and inspection
 │   │   └── report_service.py # Core business logic for report submission and tracking
 │   └── api/
 │       ├── __init__.py
@@ -56,8 +58,8 @@ whistledrop/
 │               ├── __init__.py
 │               ├── auth.py   # Moderator authentication endpoints
 │               ├── health.py # Health check probe endpoint
+│               ├── moderator.py # Protected moderator report management routes
 │               └── reports.py# Anonymous report submission & tracking endpoints
-
 └── tests/
     ├── __init__.py
     ├── conftest.py           # Test database fixtures, isolation, and async session setup
@@ -65,6 +67,7 @@ whistledrop/
     ├── test_config.py        # Configuration, CORS, and secret validation tests
     ├── test_database.py      # Database models, constraints, enums, and schema tests
     ├── test_health.py        # Health and root endpoint tests
+    ├── test_moderator.py     # Protected moderator control plane tests
     ├── test_reports.py       # Report creation, validation, and crypto regression tests
     └── test_tracking.py      # Public case tracking, isolation, and minimization tests
 ```
@@ -126,7 +129,12 @@ Security controls are implemented with defense-in-depth:
    - Tiered authorization dependencies enforce least privilege using database records as the source of truth:
      - `require_moderator`: Permits authorized `MODERATOR` and `ADMIN` personnel to perform triage operations.
      - `require_admin`: Strictly limits privileged configurations and admin actions to `ADMIN` accounts.
-8. **Internal ID Concealment & Public Data Minimization:**
+8. **Protected Moderator Control Plane & Least-Privilege Representation:**
+   - Internal management endpoints (`GET /api/v1/moderator/reports`, `GET /api/v1/moderator/reports/{report_id}`) require `Depends(require_moderator)`, gating access strictly to authorized personnel (`MODERATOR` or `ADMIN`).
+   - Querying supports filtering by `status` and `category`, deterministic ordering (`created_at.desc(), id.desc()`), and safe bounded pagination (`limit` capped at 100, `offset >= 0`).
+   - Privileged response schemas (`ModeratorReportResponse`, `ModeratorReportListResponse`) expose internal report UUIDs, timestamps, category, description, and evidence URL metadata to facilitate triage.
+   - *Privacy Isolation:* The bearer `case_code_digest`, plaintext case codes, reporter identity, and internal audit logs are strictly omitted from moderator response schemas, preserving anonymous reporter boundaries even against privileged operators.
+9. **Internal ID Concealment & Public Data Minimization:**
    - Internal database primary keys (UUIDs) remain strictly internal and are never exposed in public endpoints.
    - Public report ingestion response schema (`POST /api/v1/reports`):
      ```json
@@ -149,13 +157,13 @@ Security controls are implemented with defense-in-depth:
      }
      ```
      *Strict Omission:* Internal UUIDs, case_code_digest, description, evidence_url, audit logs, and moderator identities are completely excluded from public tracking.
-9. **Metadata-Only Evidence Handling:**
-   - Submitted `evidence_url` values are strictly validated via structured URL parsers and stored purely as text metadata. The server never makes outbound HTTP requests or fetches submitted URLs, eliminating Server-Side Request Forgery (SSRF) risks.
-10. **Production-Hardened Defaults:**
+10. **Metadata-Only Evidence Handling:**
+    - Submitted `evidence_url` values are strictly validated via structured URL parsers and stored purely as text metadata. The server never makes outbound HTTP requests or fetches submitted URLs, eliminating Server-Side Request Forgery (SSRF) risks.
+11. **Production-Hardened Defaults:**
     - `DEBUG` is strictly enforced to `False` in production environments.
     - OpenAPI documentation endpoints (`/docs`, `/redoc`, `/openapi.json`) are disabled when `DEBUG=False` to prevent API schema reconnaissance.
     - Minimum entropy requirements (min 32 characters) and placeholder rejection are enforced for production secrets at application startup.
-11. **Restrictive CORS:**
+12. **Restrictive CORS:**
     - Permissive wildcard origins (`allow_origins=["*"]`) are prohibited.
     - `allow_credentials` is set to `False` by default because authentication uses `Authorization: Bearer <token>` headers rather than browser cookies.
     - In production, CORS defaults to an empty allowlist (enforcing strict browser Same-Origin Policy) unless explicit origins are configured.
@@ -184,8 +192,10 @@ Security controls are implemented with defense-in-depth:
 - [x] **Phase 4:** Moderator Authentication & Role-Based Access Control (RBAC)
 - [x] **Phase 4.1:** Authentication Lifecycle Hardening (Account Lifecycle `is_active`, Context-Bound JWTs, DB Role Authority, Test Endpoint Removal)
 - [x] **Phase 4.2:** Authentication Enumeration & Timing Hardening (Fixed Dummy Argon2id Verification)
-- [ ] **Phase 5 (Planned):** Case Status Lifecycle Management & Immutable Audit Trail
-- [ ] **Phase 6 (Planned):** Evidence Attachment Storage & Advanced Defense (Rate Limiting, ClamAV Scanning)
+- [x] **Phase 5:** Protected Moderator Control Plane (Report Listing, Filtering, Bounded Pagination, and Detail Inspection)
+- [ ] **Phase 6 (Planned):** Case Status Lifecycle Management & Immutable Audit Trail
+- [ ] **Phase 7 (Planned):** Evidence Attachment Storage & Advanced Defense (Rate Limiting, ClamAV Scanning)
+
 
 
 
