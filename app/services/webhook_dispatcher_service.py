@@ -189,7 +189,8 @@ class WebhookDispatcherService:
         self,
         db: AsyncSession,
         event: OutboxEvent,
-        client: httpx.AsyncClient,
+        client: Optional[httpx.AsyncClient] = None,
+        worker_id: Optional[str] = None,
     ) -> bool:
         """Dispatches an event to all subscribed endpoints outside DB transactions."""
         # Query active endpoints subscribed to this event_type
@@ -212,73 +213,106 @@ class WebhookDispatcherService:
         all_succeeded = True
         last_error = None
 
-        for ep in matching_endpoints:
-            opaque_del_id = f"dlv_{secrets.token_urlsafe(24)}"
-            secret = self.decrypt_secret(ep.secret_encrypted, ep.secret_iv, ep.secret_tag)
-            sig = self.calculate_signature(secret, timestamp, payload_str)
+        async def _execute_dispatches(http_client: httpx.AsyncClient) -> None:
+            nonlocal all_succeeded, last_error
+            for ep in matching_endpoints:
+                opaque_del_id = f"dlv_{secrets.token_urlsafe(24)}"
+                secret = self.decrypt_secret(ep.secret_encrypted, ep.secret_iv, ep.secret_tag)
+                sig = self.calculate_signature(secret, timestamp, payload_str)
 
-            headers = {
-                "Content-Type": "application/json",
-                "X-WhistleDrop-Event-ID": event.opaque_event_id,
-                "X-WhistleDrop-Delivery-ID": opaque_del_id,
-                "X-WhistleDrop-Signature": f"t={timestamp},v1={sig}",
-            }
+                headers = {
+                    "Content-Type": "application/json",
+                    "X-WhistleDrop-Event-ID": event.opaque_event_id,
+                    "X-WhistleDrop-Delivery-ID": opaque_del_id,
+                    "X-WhistleDrop-Signature": f"t={timestamp},v1={sig}",
+                }
 
-            # Pre-validate SSRF and resolve
-            start_time = time.time()
-            status_code = None
-            error_msg = None
-            try:
-                # SSRF validation check
-                resolve_and_validate_destination(ep.url)
-                # HTTP dispatch (redirects disabled)
-                resp = await client.post(ep.url, content=payload_str, headers=headers)
-                latency = (time.time() - start_time) * 1000.0
-                status_code = resp.status_code
-                if resp.is_success:
-                    ep.failure_count = 0
-                else:
+                start_time = time.time()
+                status_code = None
+                error_msg = None
+                try:
+                    resolve_and_validate_destination(ep.url)
+                    resp = await http_client.post(ep.url, content=payload_str, headers=headers)
+                    latency = (time.time() - start_time) * 1000.0
+                    status_code = resp.status_code
+                    if resp.is_success:
+                        ep.failure_count = 0
+                    else:
+                        all_succeeded = False
+                        ep.failure_count += 1
+                        error_msg = f"HTTP {status_code}: {resp.text[:200]}"
+                        last_error = error_msg
+                except Exception as e:
+                    latency = (time.time() - start_time) * 1000.0
                     all_succeeded = False
                     ep.failure_count += 1
-                    error_msg = f"HTTP {status_code}: {resp.text[:200]}"
+                    error_msg = str(e)[:450]
                     last_error = error_msg
-            except Exception as e:
-                latency = (time.time() - start_time) * 1000.0
-                all_succeeded = False
-                ep.failure_count += 1
-                error_msg = str(e)[:450]
-                last_error = error_msg
 
-            # Record delivery attempt
-            delivery = WebhookDelivery(
-                outbox_event_id=event.id,
-                endpoint_id=ep.id,
-                opaque_delivery_id=opaque_del_id,
-                attempt_number=event.retry_count + 1,
-                status_code=status_code,
-                latency_ms=latency,
-                error_message=error_msg,
-            )
-            db.add(delivery)
+                delivery = WebhookDelivery(
+                    outbox_event_id=event.id,
+                    endpoint_id=ep.id,
+                    opaque_delivery_id=opaque_del_id,
+                    attempt_number=event.retry_count + 1,
+                    status_code=status_code,
+                    latency_ms=latency,
+                    error_message=error_msg,
+                )
+                db.add(delivery)
 
-        # Update event status
-        if all_succeeded:
-            event.status = "DISPATCHED"
-            event.dispatched_at = datetime.now(timezone.utc)
-            event.error_summary = None
+        if client is not None:
+            await _execute_dispatches(client)
         else:
-            event.retry_count += 1
-            if event.retry_count >= settings.OUTBOX_MAX_RETRIES:
-                event.status = "DEAD_LETTER"
-                event.error_summary = f"Max retries exceeded. Last error: {last_error}"
-            else:
-                event.status = "FAILED"
-                backoff_base = 5.0
-                backoff_delay = min(1800.0, backoff_base * (2 ** event.retry_count) + random.uniform(0.5, 3.0))
-                event.next_retry_at = datetime.now(timezone.utc) + timedelta(seconds=backoff_delay)
-                event.error_summary = last_error
+            async with httpx.AsyncClient(
+                follow_redirects=False,
+                timeout=settings.WEBHOOK_DISPATCH_TIMEOUT_SECONDS,
+            ) as default_client:
+                await _execute_dispatches(default_client)
 
-        await db.commit()
+        # Update event status with lease verification under row lock
+        now = datetime.now(timezone.utc)
+        stmt = sa.select(OutboxEvent).where(OutboxEvent.id == event.id).with_for_update()
+        current_event = (await db.execute(stmt)).scalar_one_or_none()
+
+        if current_event:
+            # If already marked DISPATCHED by another worker, leave it intact (idempotent success)
+            if current_event.status == "DISPATCHED":
+                await db.commit()
+                return True
+
+            effective_worker = worker_id or event.lease_worker_id
+            is_stolen_claim = (
+                effective_worker
+                and current_event.lease_worker_id != effective_worker
+                and current_event.status == "CLAIMED"
+                and current_event.lease_expires_at is not None
+                and current_event.lease_expires_at > now
+            )
+
+            if all_succeeded:
+                current_event.status = "DISPATCHED"
+                current_event.dispatched_at = now
+                current_event.error_summary = None
+            else:
+                if is_stolen_claim:
+                    # Do not overwrite if a newer worker actively holds the claim
+                    logger.warning(
+                        f"Outbox event {event.id} lease reclaimed by worker {current_event.lease_worker_id}; "
+                        "skipping failure status overwrite from stale worker."
+                    )
+                else:
+                    current_event.retry_count += 1
+                    if current_event.retry_count >= settings.OUTBOX_MAX_RETRIES:
+                        current_event.status = "DEAD_LETTER"
+                        current_event.error_summary = f"Max retries exceeded. Last error: {last_error}"
+                    else:
+                        current_event.status = "FAILED"
+                        backoff_base = 5.0
+                        backoff_delay = min(1800.0, backoff_base * (2 ** current_event.retry_count) + random.uniform(0.5, 3.0))
+                        current_event.next_retry_at = now + timedelta(seconds=backoff_delay)
+                        current_event.error_summary = last_error
+
+            await db.commit()
         return all_succeeded
 
 

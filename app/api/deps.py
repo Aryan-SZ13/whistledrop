@@ -123,7 +123,11 @@ async def get_current_moderator(
             session_stmt = sa.select(ModeratorSession).where(ModeratorSession.id == sid_uuid)
             session = (await db.execute(session_stmt)).scalar_one_or_none()
             if session:
-                if session.is_revoked or session.expires_at <= datetime.now(timezone.utc):
+                if (
+                    session.moderator_id != moderator.id
+                    or session.is_revoked
+                    or session.expires_at <= datetime.now(timezone.utc)
+                ):
                     raise HTTPException(
                         status_code=status.HTTP_401_UNAUTHORIZED,
                         detail="Session has been revoked",
