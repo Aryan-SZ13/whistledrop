@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, Any, List, Optional
 import sqlalchemy as sa
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -46,6 +46,49 @@ class Moderator(Base):
         default=True,
         server_default=sa.true(),
         nullable=False,
+    )
+    token_version: Mapped[int] = mapped_column(
+        sa.Integer,
+        default=1,
+        server_default=sa.text("1"),
+        nullable=False,
+    )
+    totp_secret_encrypted: Mapped[Optional[bytes]] = mapped_column(
+        sa.LargeBinary,
+        nullable=True,
+    )
+    totp_secret_iv: Mapped[Optional[bytes]] = mapped_column(
+        sa.LargeBinary,
+        nullable=True,
+    )
+    totp_secret_tag: Mapped[Optional[bytes]] = mapped_column(
+        sa.LargeBinary,
+        nullable=True,
+    )
+    is_totp_enabled: Mapped[bool] = mapped_column(
+        sa.Boolean,
+        default=False,
+        server_default=sa.false(),
+        nullable=False,
+        index=True,
+    )
+    totp_enrolled_at: Mapped[Optional[datetime]] = mapped_column(
+        sa.DateTime(timezone=True),
+        nullable=True,
+    )
+    backup_codes: Mapped[Optional[Any]] = mapped_column(
+        sa.JSON,
+        nullable=True,
+    )
+    failed_totp_attempts: Mapped[int] = mapped_column(
+        sa.Integer,
+        default=0,
+        server_default=sa.text("0"),
+        nullable=False,
+    )
+    totp_locked_until: Mapped[Optional[datetime]] = mapped_column(
+        sa.DateTime(timezone=True),
+        nullable=True,
     )
     created_at: Mapped[datetime] = mapped_column(
         sa.DateTime(timezone=True),

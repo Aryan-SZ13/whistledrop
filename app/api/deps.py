@@ -59,6 +59,30 @@ async def get_current_moderator(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    # 1. Fast-path Redis revocation check
+    from app.db.redis import get_redis
+    jti = payload.get("jti")
+    sid = payload.get("sid")
+    try:
+        redis = get_redis()
+        if jti and await redis.get(f"revocation:jti:{jti}"):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token has been revoked",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        if sid and await redis.get(f"revocation:session:{sid}"):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Session has been revoked",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.debug(f"Fast-path Redis check skipped on connection issue: {e}")
+
+    # 2. Authoritative PostgreSQL verification
     moderator = await auth_service.get_moderator_by_id(db, moderator_id)
     if moderator is None:
         raise HTTPException(
@@ -74,6 +98,39 @@ async def get_current_moderator(
             detail="Could not validate credentials",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
+    # 3. Persistent token_version verification
+    token_version = payload.get("token_version", 1)
+    if token_version != moderator.token_version:
+        logger.warning(
+            "Access rejected due to token_version mismatch: token=%s, db=%s",
+            token_version,
+            moderator.token_version,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token has been invalidated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    # 4. Persistent session verification
+    if sid:
+        import sqlalchemy as sa
+        from app.models.moderator_session import ModeratorSession
+        from datetime import datetime, timezone
+        try:
+            sid_uuid = uuid.UUID(str(sid))
+            session_stmt = sa.select(ModeratorSession).where(ModeratorSession.id == sid_uuid)
+            session = (await db.execute(session_stmt)).scalar_one_or_none()
+            if session:
+                if session.is_revoked or session.expires_at <= datetime.now(timezone.utc):
+                    raise HTTPException(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        detail="Session has been revoked",
+                        headers={"WWW-Authenticate": "Bearer"},
+                    )
+        except ValueError:
+            pass
 
     return moderator
 

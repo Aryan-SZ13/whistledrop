@@ -70,7 +70,21 @@ class ReportService:
                 },
             )
 
-            # 5. Commit both records atomically
+            # 4b. Publish transactional outbox event
+            from app.services.outbox_service import outbox_service
+            await outbox_service.publish_event(
+                db=db,
+                event_type="report.created",
+                report_id=report.id,
+                case_code_digest=report.case_code_digest,
+                raw_data={
+                    "status": report.status.value,
+                    "category": report.category.value,
+                    "priority": report.priority.value,
+                },
+            )
+
+            # 5. Commit all records atomically
             await db.commit()
             await db.refresh(report)
 

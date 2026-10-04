@@ -123,10 +123,19 @@ class RetentionService:
                 metadata={
                     "event": "whistleblower_withdrawal",
                     "keys_destroyed": len(attachments_to_shred),
-                    "attachment_ids": [str(a.id) for a in attachments_to_shred],
                 },
                 created_at=now,
             )
+
+        # Publish transactional outbox event
+        from app.services.outbox_service import outbox_service
+        await outbox_service.publish_event(
+            db=db,
+            event_type="report.withdrawn",
+            report_id=report.id,
+            case_code_digest=report.case_code_digest,
+            raw_data={"status": report.status.value, "category": report.category.value},
+        )
 
         # Commit DB transaction atomically
         await db.commit()
@@ -201,15 +210,42 @@ class RetentionService:
         )
 
     async def execute_retention_sweep(
-        self, db_factory, limit: Optional[int] = None
+        self,
+        db_factory,
+        limit: Optional[int] = None,
+        quorum_context: Optional[Any] = None,
     ) -> RetentionExecuteResponse:
         """
         Executes distributed-locked retention shredding:
+          - Requires dual-control Quorum approval when settings.QUORUM_ENFORCE_RETENTION is enabled.
           - Acquires Redis advisory lock with CSPRNG owner token.
           - Sweeps expired terminal reports.
           - Per case: redacts case content, destroys notes, shreds evidence keys, appends audit tombstone.
           - Releases Redis lock via Lua compare-and-delete.
         """
+        if settings.QUORUM_ENFORCE_RETENTION and quorum_context is None:
+            from app.services.quorum_service import QuorumRequiredException
+            raise QuorumRequiredException(
+                action_type="MANUAL_RETENTION_SWEEP",
+                details={"limit": limit or settings.RETENTION_BATCH_SIZE},
+            )
+        return await self._run_retention_sweep(db_factory, limit=limit, quorum_context=quorum_context)
+
+    async def execute_retention_sweep_internal(
+        self,
+        db: AsyncSession,
+        limit: Optional[int] = None,
+        quorum_context: Optional[Any] = None,
+    ) -> RetentionExecuteResponse:
+        from app.db.session import async_session_factory
+        return await self._run_retention_sweep(async_session_factory, limit=limit, quorum_context=quorum_context)
+
+    async def _run_retention_sweep(
+        self,
+        db_factory,
+        limit: Optional[int] = None,
+        quorum_context: Optional[Any] = None,
+    ) -> RetentionExecuteResponse:
         batch_limit = limit or settings.RETENTION_BATCH_SIZE
         redis = get_redis()
         if inspect.isawaitable(redis):

@@ -72,7 +72,7 @@ def test_jwt_contains_only_intended_claims():
     decoded = decode_access_token(token)
 
     # Required claims strictly match expected specification
-    expected_claims = {"sub", "iat", "exp", "iss", "aud"}
+    expected_claims = {"sub", "iat", "exp", "iss", "aud", "sid", "jti", "token_version", "auth_level"}
     assert set(decoded.keys()) == expected_claims
 
     assert decoded["sub"] == subject_id

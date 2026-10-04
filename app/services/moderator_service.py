@@ -340,6 +340,7 @@ class ModeratorService:
         expected_version: int,
         moderator: Moderator,
         reopen_reason: Optional[str] = None,
+        quorum_context: Optional[Any] = None,
     ) -> ModeratorReportResponse:
         """Atomically transition report status with mandatory OCC and role authorization."""
         try:
@@ -373,6 +374,18 @@ class ModeratorService:
                     )
                 if not reopen_reason or len(reopen_reason.strip()) < 10:
                     raise ValueError("A valid reopen_reason (minimum 10 characters) is required to reopen closed reports.")
+
+                # Quorum enforcement check
+                if settings.QUORUM_ENFORCE_CASE_REOPEN and quorum_context is None:
+                    from app.services.quorum_service import QuorumRequiredException
+                    raise QuorumRequiredException(
+                        action_type="ADMIN_CASE_REOPEN",
+                        target_id=str(report.id),
+                        details={
+                            "expected_version": expected_version,
+                            "reopen_reason": reopen_reason.strip(),
+                        },
+                    )
 
                 action = "REPORT_REOPENED"
                 audit_meta = {
@@ -412,6 +425,20 @@ class ModeratorService:
                 created_at=now,
             )
 
+            # Publish transactional outbox event
+            from app.services.outbox_service import outbox_service
+            await outbox_service.publish_event(
+                db=db,
+                event_type="report.status_changed",
+                report_id=report.id,
+                case_code_digest=report.case_code_digest,
+                raw_data={
+                    "status": new_status.value,
+                    "category": report.category.value,
+                    "priority": report.priority.value,
+                },
+            )
+
             await db.commit()
             await db.refresh(report)
 
@@ -440,6 +467,49 @@ class ModeratorService:
         except Exception:
             await db.rollback()
             raise
+
+    async def reopen_report_internal(
+        self,
+        db: AsyncSession,
+        report_id: uuid.UUID,
+        expected_version: int,
+        reopen_reason: str,
+        admin_id: uuid.UUID,
+        quorum_context: Any,
+    ) -> Tuple[Report, Any]:
+        """Internal execution helper for Quorum-approved case reopening."""
+        stmt = sa.select(Report).where(Report.id == report_id).with_for_update()
+        report = (await db.execute(stmt)).scalar_one_or_none()
+        if not report:
+            raise ReportNotFoundError(f"Report {report_id} not found.")
+        if report.version_id != expected_version:
+            raise VersionConflictError(expected_version, report.version_id)
+        if report.status not in (ReportStatus.RESOLVED, ReportStatus.DISMISSED):
+            raise InvalidStateTransitionError(report.status, ReportStatus.UNDER_REVIEW, "Report is not in a closed state.")
+
+        from_status = report.status
+        now = datetime.now(timezone.utc)
+        report.status = ReportStatus.UNDER_REVIEW
+        report.version_id += 1
+        report.status_version += 1
+        report.updated_at = now
+        report.terminal_at = None
+
+        audit_entry = await audit_service.append_entry(
+            db=db,
+            report_id=report.id,
+            action="REPORT_REOPENED",
+            actor_type="MODERATOR",
+            actor_id=admin_id,
+            metadata={
+                "from_status": from_status.value,
+                "to_status": ReportStatus.UNDER_REVIEW.value,
+                "reopen_reason": reopen_reason.strip(),
+                "quorum_id": str(quorum_context.quorum_id),
+            },
+            created_at=now,
+        )
+        return report, audit_entry
 
     async def update_report_priority(
         self,

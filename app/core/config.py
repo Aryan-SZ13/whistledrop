@@ -9,12 +9,20 @@ DEV_INSECURE_CURSOR_SECRET = "dev-insecure-cursor-secret-key-change-in-productio
 DEV_INSECURE_AUDIT_CHAIN_SECRET = "dev-insecure-audit-chain-secret-key-change-in-production-min32"
 DEV_INSECURE_EVIDENCE_KEK_SECRET = "dev-insecure-evidence-kek-secret-key-change-in-production-min32"
 DEV_INSECURE_EXPORT_SIGNING_KEY_ED25519_PRIVATE = "a1" * 32
+DEV_INSECURE_MFA_KEK_SECRET = "dev-insecure-mfa-kek-secret-key-change-in-production-min32byt"
+DEV_INSECURE_REFRESH_SECRET = "dev-insecure-refresh-secret-key-change-in-production-min32"
+DEV_INSECURE_WEBHOOK_KEK_SECRET = "dev-insecure-webhook-kek-secret-change-in-production-min32"
+DEV_INSECURE_WEBHOOK_SALT = "dev-insecure-webhook-salt-change-in-production-min32bytes"
 ENV_EXAMPLE_PLACEHOLDER_JWT = "replace-with-a-secure-random-secret-for-jwt-tokens-minimum-32-chars"
 ENV_EXAMPLE_PLACEHOLDER_CASE = "replace-with-a-secure-random-secret-for-case-codes-minimum-32-chars"
 ENV_EXAMPLE_PLACEHOLDER_RATE_LIMIT = "replace-with-a-secure-random-secret-for-rate-limit-keys-min-32"
 ENV_EXAMPLE_PLACEHOLDER_CURSOR = "replace-with-a-secure-random-secret-for-cursor-signing-minimum-32"
 ENV_EXAMPLE_PLACEHOLDER_AUDIT_CHAIN = "replace-with-a-secure-random-secret-for-audit-chain-min-32-chars"
 ENV_EXAMPLE_PLACEHOLDER_EVIDENCE_KEK = "replace-with-a-secure-random-secret-for-evidence-kek-min-32-char"
+ENV_EXAMPLE_PLACEHOLDER_MFA_KEK = "replace-with-a-secure-random-secret-for-mfa-kek-min-32-chars"
+ENV_EXAMPLE_PLACEHOLDER_REFRESH = "replace-with-a-secure-random-secret-for-refresh-token-min-32-chars"
+ENV_EXAMPLE_PLACEHOLDER_WEBHOOK_KEK = "replace-with-a-secure-random-secret-for-webhook-kek-min-32-chars"
+ENV_EXAMPLE_PLACEHOLDER_WEBHOOK_SALT = "replace-with-a-secure-random-secret-for-webhook-salt-min-32-char"
 
 DEFAULT_DEV_CORS_ORIGINS: List[str] = [
     "http://localhost:3000",
@@ -112,6 +120,32 @@ class Settings(BaseSettings):
     WITHDRAWAL_RATE_WINDOW_SECONDS: int = 60
     VERIFICATION_RECEIPT_RATE_LIMIT: int = 30
     VERIFICATION_RECEIPT_RATE_WINDOW_SECONDS: int = 60
+
+    # Phase 15: Moderator MFA & Session Revocation
+    MFA_KEK_SECRET: str = DEV_INSECURE_MFA_KEK_SECRET
+    REFRESH_SECRET: str = DEV_INSECURE_REFRESH_SECRET
+    MFA_SETUP_TICKET_EXPIRE_SECONDS: int = 300
+    MFA_CHALLENGE_TICKET_EXPIRE_SECONDS: int = 300
+    MFA_PENDING_SECRET_EXPIRE_SECONDS: int = 600
+    MFA_MAX_FAILED_ATTEMPTS: int = 5
+    MFA_LOCKOUT_SECONDS: int = 900
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+
+    # Phase 16: Transactional Outbox & Signed Webhooks
+    WEBHOOK_KEK_SECRET: str = DEV_INSECURE_WEBHOOK_KEK_SECRET
+    WEBHOOK_SALT: str = DEV_INSECURE_WEBHOOK_SALT
+    ALLOW_HTTP_WEBHOOKS: bool = False
+    OUTBOX_LEASE_TTL_SECONDS: int = 60
+    OUTBOX_BATCH_SIZE: int = 50
+    OUTBOX_MAX_RETRIES: int = 5
+    WEBHOOK_DISPATCH_TIMEOUT_SECONDS: float = 10.0
+
+    # Phase 17: Dual-Control Quorum Governance
+    QUORUM_DEFAULT_TTL_MINUTES: int = 60
+    QUORUM_ENFORCE_RETENTION: bool = False
+    QUORUM_ENFORCE_CASE_REOPEN: bool = False
+    QUORUM_ENFORCE_MODERATOR_CHANGES: bool = False
+    QUORUM_ENFORCE_WEBHOOK_DELETE: bool = False
 
     # Configurable CORS Origins
     BACKEND_CORS_ORIGINS: Union[List[str], str] = []
@@ -279,6 +313,42 @@ class Settings(BaseSettings):
                 hashlib.sha256,
             ).hexdigest()
 
+        if is_production and self.MFA_KEK_SECRET in (DEV_INSECURE_MFA_KEK_SECRET, ENV_EXAMPLE_PLACEHOLDER_MFA_KEK):
+            import hmac
+            import hashlib
+            self.MFA_KEK_SECRET = hmac.new(
+                self.CASE_CODE_SECRET.encode("utf-8"),
+                b"whistledrop-mfa-kek-secret-domain-separation",
+                hashlib.sha256,
+            ).hexdigest()
+
+        if is_production and self.REFRESH_SECRET in (DEV_INSECURE_REFRESH_SECRET, ENV_EXAMPLE_PLACEHOLDER_REFRESH):
+            import hmac
+            import hashlib
+            self.REFRESH_SECRET = hmac.new(
+                self.CASE_CODE_SECRET.encode("utf-8"),
+                b"whistledrop-refresh-secret-domain-separation",
+                hashlib.sha256,
+            ).hexdigest()
+
+        if is_production and self.WEBHOOK_KEK_SECRET in (DEV_INSECURE_WEBHOOK_KEK_SECRET, ENV_EXAMPLE_PLACEHOLDER_WEBHOOK_KEK):
+            import hmac
+            import hashlib
+            self.WEBHOOK_KEK_SECRET = hmac.new(
+                self.CASE_CODE_SECRET.encode("utf-8"),
+                b"whistledrop-webhook-kek-secret-domain-separation",
+                hashlib.sha256,
+            ).hexdigest()
+
+        if is_production and self.WEBHOOK_SALT in (DEV_INSECURE_WEBHOOK_SALT, ENV_EXAMPLE_PLACEHOLDER_WEBHOOK_SALT):
+            import hmac
+            import hashlib
+            self.WEBHOOK_SALT = hmac.new(
+                self.CASE_CODE_SECRET.encode("utf-8"),
+                b"whistledrop-webhook-salt-domain-separation",
+                hashlib.sha256,
+            ).hexdigest()
+
         # 3. Secret Separation & Non-Reuse Verification
         secrets_set = {
             self.JWT_SECRET,
@@ -287,11 +357,14 @@ class Settings(BaseSettings):
             self.CURSOR_SECRET,
             self.AUDIT_CHAIN_SECRET,
             self.EVIDENCE_KEK_SECRET,
+            self.MFA_KEK_SECRET,
+            self.REFRESH_SECRET,
+            self.WEBHOOK_KEK_SECRET,
+            self.WEBHOOK_SALT,
         }
-        if len(secrets_set) < 6:
+        if len(secrets_set) < 10:
             raise ValueError(
-                "JWT_SECRET, CASE_CODE_SECRET, RATE_LIMIT_KEY_SECRET, CURSOR_SECRET, "
-                "AUDIT_CHAIN_SECRET, and EVIDENCE_KEK_SECRET must be distinct secrets. "
+                "Cryptographic secrets must be distinct secrets. "
                 "Do NOT reuse the same secret across different security contexts."
             )
 

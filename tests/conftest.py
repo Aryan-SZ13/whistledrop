@@ -38,12 +38,20 @@ async def clean_database():
     evidence_service.db_engine = test_engine
     async with test_engine.begin() as conn:
         await conn.execute(
-            sa.text("TRUNCATE reports, moderators, report_updates, audit_logs, evidence_attachments, case_messages, case_message_moderator_read_state CASCADE")
+            sa.text(
+                "TRUNCATE reports, moderators, report_updates, audit_logs, evidence_attachments, "
+                "case_messages, case_message_moderator_read_state, moderator_sessions, webhook_endpoints, "
+                "outbox_events, webhook_deliveries, quorum_requests CASCADE"
+            )
         )
     yield
     async with test_engine.begin() as conn:
         await conn.execute(
-            sa.text("TRUNCATE reports, moderators, report_updates, audit_logs, evidence_attachments, case_messages, case_message_moderator_read_state CASCADE")
+            sa.text(
+                "TRUNCATE reports, moderators, report_updates, audit_logs, evidence_attachments, "
+                "case_messages, case_message_moderator_read_state, moderator_sessions, webhook_endpoints, "
+                "outbox_events, webhook_deliveries, quorum_requests CASCADE"
+            )
         )
 
 

@@ -85,16 +85,25 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
         return False
 
 
+import base64
+import struct
+import time
+from typing import List
+
+
 def create_access_token(
     subject: str,
+    sid: Optional[str] = None,
+    jti: Optional[str] = None,
+    token_version: int = 1,
+    auth_level: str = "pwd",
     expires_delta: Optional[timedelta] = None,
 ) -> str:
     """Create a signed, short-lived JWT access token for moderator authentication.
 
-    Uses JWT_SECRET exclusively (never CASE_CODE_SECRET).
-    Payload strictly contains: 'sub', 'iat', 'exp', 'iss', 'aud'.
-    Does NOT contain role, passwords, hashes, case codes, report data, or PII.
-    The database remains the authoritative source of truth for user roles and status.
+    Uses JWT_SECRET exclusively.
+    Payload contains: 'sub', 'sid', 'jti', 'token_version', 'auth_level', 'iat', 'exp', 'iss', 'aud'.
+    The database remains the authoritative source of truth for user roles and lifecycle.
     """
     now = datetime.now(timezone.utc)
     if expires_delta is not None:
@@ -104,6 +113,10 @@ def create_access_token(
 
     payload: Dict[str, Any] = {
         "sub": str(subject),
+        "sid": str(sid or secrets.token_hex(16)),
+        "jti": str(jti or secrets.token_hex(16)),
+        "token_version": int(token_version),
+        "auth_level": str(auth_level),
         "iat": int(now.timestamp()),
         "exp": int(expire.timestamp()),
         "iss": settings.JWT_ISSUER,
@@ -115,9 +128,7 @@ def create_access_token(
 def decode_access_token(token: str) -> Dict[str, Any]:
     """Decode and validate a JWT access token against configured issuer, audience, and algorithm.
 
-    Raises jwt.PyJWTError subclasses (ExpiredSignatureError, InvalidTokenError,
-    InvalidIssuerError, InvalidAudienceError, MissingRequiredClaimError)
-    if the token is invalid, expired, unverified, or uses an unauthorized algorithm.
+    Raises jwt.PyJWTError subclasses if the token is invalid, expired, or unverified.
     """
     return jwt.decode(
         token,
@@ -134,3 +145,63 @@ def decode_access_token(token: str) -> Dict[str, Any]:
     )
 
 
+def generate_totp_secret() -> str:
+    """Generate a 160-bit cryptographically secure base32 TOTP secret (RFC 6238)."""
+    return base64.b32encode(secrets.token_bytes(20)).decode("utf-8")
+
+
+def get_totp_code(secret: str, time_step: int = 30, for_time: Optional[float] = None) -> str:
+    """Calculate the 6-digit numeric TOTP code for a secret and timestamp (RFC 6238 standard)."""
+    if for_time is None:
+        for_time = time.time()
+    counter = int(for_time // time_step)
+    key = base64.b32decode(secret, casefold=True)
+    msg = struct.pack(">Q", counter)
+    h = hmac.new(key, msg, hashlib.sha1).digest()
+    offset = h[-1] & 0x0F
+    code_int = struct.unpack(">I", h[offset:offset + 4])[0] & 0x7FFFFFFF
+    return f"{code_int % 1000000:06d}"
+
+
+def verify_totp_code(secret: str, code: str, time_step: int = 30, window: int = 1) -> bool:
+    """Verify a user-provided TOTP code against the secret within a drift window."""
+    if not code or len(code.strip()) != 6 or not code.strip().isdigit():
+        return False
+    current_time = time.time()
+    for drift in range(-window, window + 1):
+        target_time = current_time + (drift * time_step)
+        expected = get_totp_code(secret, time_step=time_step, for_time=target_time)
+        if hmac.compare_digest(expected, code.strip()):
+            return True
+    return False
+
+
+def generate_recovery_codes(count: int = 10) -> List[str]:
+    """Generate single-use alphanumeric backup recovery codes (16 chars with hyphen)."""
+    codes: List[str] = []
+    for _ in range(count):
+        raw = secrets.token_hex(8)  # 16 hex chars
+        formatted = f"{raw[:4]}-{raw[4:8]}-{raw[8:12]}-{raw[12:]}"
+        codes.append(formatted)
+    return codes
+
+
+def hash_recovery_code(code: str) -> str:
+    """Hash a single recovery code using Argon2id."""
+    clean_code = code.replace("-", "").strip().lower()
+    return hash_password(clean_code)
+
+
+def verify_recovery_code(code: str, hashed_code: str) -> bool:
+    """Verify a single recovery code against its Argon2id hash."""
+    clean_code = code.replace("-", "").strip().lower()
+    return verify_password(clean_code, hashed_code)
+
+
+def hash_refresh_token(token: str) -> str:
+    """Derive one-way HMAC-SHA256 hash for storing refresh token."""
+    return hmac.new(
+        settings.REFRESH_SECRET.encode("utf-8"),
+        token.strip().encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()

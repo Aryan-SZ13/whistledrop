@@ -16,6 +16,9 @@ from app.models.report_update import ReportUpdate
 from app.models.audit_log import AuditLog
 from app.models.evidence import EvidenceAttachment
 from app.models.case_message import CaseMessage, CaseMessageModeratorReadState
+from app.models.moderator_session import ModeratorSession
+from app.models.webhook import WebhookEndpoint, OutboxEvent, WebhookDelivery
+from app.models.quorum import QuorumRequest
 
 __all__ = [
     "Base",
@@ -33,4 +36,9 @@ __all__ = [
     "EvidenceAttachment",
     "CaseMessage",
     "CaseMessageModeratorReadState",
+    "ModeratorSession",
+    "WebhookEndpoint",
+    "OutboxEvent",
+    "WebhookDelivery",
+    "QuorumRequest",
 ]
