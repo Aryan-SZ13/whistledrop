@@ -3,14 +3,22 @@ import logging
 from typing import Optional
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Path, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query, Request, Response, status
 from fastapi.responses import FileResponse, JSONResponse
+import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import require_moderator
 from app.db.session import get_db
-from app.models.enums import ReportCategory, ReportPriority, ReportStatus
+from app.models.enums import MessageSenderType, ReportCategory, ReportPriority, ReportStatus
 from app.models.moderator import Moderator
+from app.models.report import Report
+from app.schemas.case_message import (
+    CaseMessageListResponse,
+    CaseMessageResponse,
+    MessageReadAckRequest,
+    MessageReadAckResponse,
+)
 from app.schemas.evidence import (
     EvidenceModeratorListResponse,
     EvidenceModeratorResponse,
@@ -26,6 +34,13 @@ from app.schemas.moderator import (
     ReportPriorityUpdateRequest,
     ReportStatusUpdateRequest,
     TimelineListResponse,
+)
+from app.services.case_channel_service import (
+    CaseClosedError,
+    InvalidCursorError as ChannelInvalidCursorError,
+    MessageNotFoundError as ChannelMessageNotFoundError,
+    case_channel_service,
+    read_and_validate_message_payload,
 )
 from app.services.evidence_service import (
     EvidenceNotAvailableError,
@@ -435,4 +450,100 @@ async def download_report_evidence(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Evidence attachment not available",
         )
+
+
+@router.get(
+    "/reports/{report_id}/messages",
+    response_model=CaseMessageListResponse,
+    status_code=status.HTTP_200_OK,
+    summary="List messages for a report",
+    description="Retrieve cursor-paginated messages for a case conversation as an authorized moderator.",
+)
+async def list_report_messages_for_moderator(
+    report_id: uuid.UUID = Path(..., description="Report UUID"),
+    cursor: Optional[str] = Query(None, max_length=512),
+    limit: int = Query(20, ge=1, le=100),
+    current_moderator: Moderator = Depends(require_moderator),
+    db: AsyncSession = Depends(get_db),
+) -> CaseMessageListResponse:
+    stmt = sa.select(Report).where(Report.id == report_id)
+    res = await db.execute(stmt)
+    report = res.scalar_one_or_none()
+    if not report:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Report not found")
+
+    try:
+        return await case_channel_service.list_messages(
+            db=db,
+            report_id=report_id,
+            cursor=cursor,
+            limit=limit,
+            caller_sender_type=MessageSenderType.MODERATOR,
+            moderator_id=current_moderator.id,
+        )
+    except ChannelInvalidCursorError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
+
+
+@router.post(
+    "/reports/{report_id}/messages",
+    response_model=CaseMessageResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Post public reply to whistleblower",
+    description="Post a public moderator reply to the anonymous case channel.",
+)
+async def post_moderator_message(
+    request: Request,
+    response: Response,
+    report_id: uuid.UUID = Path(..., description="Report UUID"),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+    current_moderator: Moderator = Depends(require_moderator),
+    db: AsyncSession = Depends(get_db),
+) -> CaseMessageResponse:
+    content = await read_and_validate_message_payload(request)
+    try:
+        msg, is_recovered = await case_channel_service.create_message(
+            db=db,
+            report_id=report_id,
+            sender_type=MessageSenderType.MODERATOR,
+            content=content,
+            moderator=current_moderator,
+            idempotency_key=idempotency_key,
+        )
+    except CaseClosedError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+
+    if is_recovered:
+        response.headers["X-Cache-Lookup"] = "HIT"
+
+    return CaseMessageResponse(
+        id=msg.public_id,
+        sender=msg.sender_type.value,
+        content=msg.content,
+        created_at=msg.created_at,
+    )
+
+
+@router.post(
+    "/reports/{report_id}/messages/read",
+    response_model=MessageReadAckResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Acknowledge moderator message read state",
+    description="Monotonically advance the moderator's read high-water mark for this report.",
+)
+async def acknowledge_moderator_messages_read(
+    read_req: MessageReadAckRequest,
+    report_id: uuid.UUID = Path(..., description="Report UUID"),
+    current_moderator: Moderator = Depends(require_moderator),
+    db: AsyncSession = Depends(get_db),
+) -> MessageReadAckResponse:
+    try:
+        return await case_channel_service.advance_moderator_read_state(
+            db=db,
+            report_id=report_id,
+            moderator_id=current_moderator.id,
+            public_message_id=read_req.last_read_message_id,
+        )
+    except ChannelMessageNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 

@@ -382,6 +382,7 @@ class ModeratorService:
 
             report.status = new_status
             report.version_id += 1
+            report.status_version += 1
             report.updated_at = now
 
             audit = AuditLog(

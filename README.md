@@ -44,16 +44,19 @@ whistledrop/
 │   │   ├── report.py         # Core whistleblower report schema
 │   │   ├── report_update.py  # Moderator case status updates and internal notes
 │   │   ├── audit_log.py      # Action audit logs
-│   │   └── evidence.py       # Evidence attachment metadata and scan state
+│   │   ├── evidence.py       # Evidence attachment metadata and scan state
+│   │   └── case_message.py   # Anonymous case messages and moderator read states (Phases 11-12)
 │   ├── schemas/
 │   │   ├── __init__.py       # Pydantic schemas export
 │   │   ├── auth.py           # Moderator login and token schemas
 │   │   ├── moderator.py      # Moderator report listing, status update, priority, assignment, timeline & stats schemas
 │   │   ├── report.py         # Public request and response schemas
-│   │   └── evidence.py       # Evidence upload and moderator view schemas
+│   │   ├── evidence.py       # Evidence upload and moderator view schemas
+│   │   └── case_message.py   # Two-way messages, read state, and notification schemas (Phases 11-12)
 │   ├── services/
 │   │   ├── __init__.py       # Services export
 │   │   ├── auth_service.py   # Moderator authentication, hashing, and token issuance
+│   │   ├── case_channel_service.py # Anonymous messaging, read states, HMAC cursor signing, Lua CAS idempotency
 │   │   ├── clamav_service.py # Asynchronous ClamAV client via INSTREAM protocol
 │   │   ├── evidence_service.py # Validation, storage, atomic promotion, and reconciliation
 │   │   ├── moderator_service.py # Case triage, mandatory OCC, assignment, priority, timeline, and stats
@@ -69,12 +72,13 @@ whistledrop/
 │               ├── __init__.py
 │               ├── auth.py   # Moderator authentication endpoints (rate limited)
 │               ├── health.py # Health check, readiness probe, and authenticated metrics endpoints
-│               ├── moderator.py # Protected moderator case management & evidence routes
-│               └── reports.py# Anonymous report submission, evidence upload & tracking endpoints
+│               ├── moderator.py # Protected moderator case management, evidence & message routes
+│               └── reports.py# Anonymous report submission, evidence, tracking, two-way messaging & notifications
 └── tests/
     ├── __init__.py
     ├── conftest.py           # Test database & Redis fixtures, isolation, and session setup
     ├── test_auth.py          # Argon2id, JWT lifecycle, RBAC, and login tests
+    ├── test_case_communication.py # Phase 11-12: Two-way communication, read states, notifications, idempotency
     ├── test_config.py        # Configuration, CORS, and secret validation tests
     ├── test_database.py      # Database models, constraints, enums, and schema tests
     ├── test_evidence.py      # Evidence upload, validation, ClamAV, promotion, and reconciliation
@@ -422,6 +426,38 @@ WhistleDrop provides an enterprise-grade case triage and management plane:
 
 ---
 
+## Anonymous Case Communication & Notifications (Phases 11 & 12)
+
+WhistleDrop features an anonymous, end-to-end privacy-preserving two-way communication channel between anonymous whistleblowers and verified moderators, complemented by metadata-minimizing case notification polling.
+
+### Key Architecture & Security Invariants
+
+1. **Anonymous Credential & Header Isolation:**
+   - All Phase 11 and 12 anonymous endpoints require authentication strictly via the `X-Case-Code` request header (never passed via URL parameters, paths, or query strings). The legacy `/reports/{case_code}` tracking endpoint remains intact for backward compatibility.
+   - Case codes are verified in constant time using `hmac.compare_digest` against HMAC-SHA256 digests in PostgreSQL.
+2. **Opaque Public Identifiers & Identity Secrecy:**
+   - Public message identifiers (`id`) use opaque, high-entropy random identifiers (`msg_...` with 128-bit CSPRNG entropy). Internal database UUIDs are never exposed to reporters.
+   - Internal database IDs, report UUIDs, moderator UUIDs, moderator usernames, and IP addresses are completely excluded from whistleblower responses.
+3. **Deterministic Keyset Pagination & Cursor Tamper-Resistance:**
+   - Pagination operates chronologically via deterministic composite tuples `(created_at, id)`.
+   - Cursors are signed with HMAC-SHA256 using a dedicated `CURSOR_SECRET` (distinct from `JWT_SECRET`, `CASE_CODE_SECRET`, and `RATE_LIMIT_KEY_SECRET`). Corrupted, tampered, or expired cursors are cleanly rejected with HTTP 422.
+4. **Per-Moderator vs. Single-Reporter High-Water Marks:**
+   - Reporter read state is tracked per report (`reporter_last_read_created_at`, `reporter_last_read_message_id`), advancing monotonically using composite tuple comparisons: `created_at > :t OR (created_at = :t AND id > :id)`.
+   - Moderator read state is isolated per moderator and case via `case_message_moderator_read_state`, preventing team members from inadvertently clearing each other's unread badges.
+5. **Atomic CAS Idempotency & Crash Recovery:**
+   - Safe retries via client-supplied `Idempotency-Key` headers (UUIDv4/opaque string).
+   - Backed by an atomic Redis Lua compare-and-set / compare-and-delete script with cryptographically random `owner_token` tracking to eliminate race conditions and late worker state clobbering.
+   - Backstopped by partial unique indexes in PostgreSQL (`uq_case_messages_reporter_idempotency`, `uq_case_messages_moderator_idempotency`) for automated recovery even under Redis restarts.
+6. **Case Lifecycle Serialization & Terminal Row-Locking:**
+   - Posting messages acquires an exclusive row lock (`SELECT ... FOR UPDATE`) on the target `Report`.
+   - Cases in terminal states (`RESOLVED` or `DISMISSED`) strictly reject new messages with HTTP 409 Conflict. Reopening a case by an admin restores messaging capability.
+7. **Abuse Mitigation & Strict No-Store Cache Policy:**
+   - Raw request payloads are capped at 64 KiB at the socket transport layer prior to JSON parsing, preventing memory bloat from multibyte characters or unicode escapes. Message bodies are capped at 5,000 characters.
+   - All anonymous tracking, messaging, and notification endpoints enforce a strict no-store cache policy (`Cache-Control: no-store, no-cache, must-revalidate, max-age=0`, `Pragma: no-cache`, `Expires: 0`).
+   - Route precedence ensures static `/reports/messages` and `/reports/notifications` routes are prioritized before dynamic path matches.
+
+---
+
 ## Development Roadmap
 
 - [x] **Phase 0:** Backend Foundation, Configuration & Health Check
@@ -440,6 +476,8 @@ WhistleDrop provides an enterprise-grade case triage and management plane:
 - [x] **Phase 8:** Evidence Attachment Storage & Antivirus Scanning (ClamAV)
 - [x] **Phase 9:** Production Observability & Reliability (Structured JSON Logging, Request IDs, Health/Readiness Probes, Authenticated Prometheus Metrics)
 - [x] **Phase 10:** Advanced Moderator Case Management (Mandatory OCC, Priority, Assignment, Cursor-Paginated Timeline, Dashboard Aggregates)
+- [x] **Phase 11:** Anonymous Two-Way Case Communication (High-Entropy Public Message IDs, Keyset Cursor Pagination, OCC/Terminal Row-Locking, Redis CAS Idempotency, 64 KiB Raw Transport Bound)
+- [x] **Phase 12:** Anonymous Case Notifications & Read States (Per-Moderator High-Water Marks, Reporter Case Status Versioning, Deterministic Tuple Ordering, Strict No-Store Cache Policy)
 
 ---
 

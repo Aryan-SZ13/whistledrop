@@ -48,3 +48,8 @@ class EvidenceScanStatus(str, enum.Enum):
     SCAN_FAILED = "SCAN_FAILED"
     DELETED = "DELETED"
 
+
+class MessageSenderType(str, enum.Enum):
+    """Sender classification for case messages."""
+    REPORTER = "REPORTER"
+    MODERATOR = "MODERATOR"

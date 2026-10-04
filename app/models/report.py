@@ -81,6 +81,27 @@ class Report(Base):
         default=1,
         server_default="1",
     )
+    status_version: Mapped[int] = mapped_column(
+        sa.Integer,
+        nullable=False,
+        default=1,
+        server_default="1",
+    )
+    reporter_acknowledged_status_version: Mapped[int] = mapped_column(
+        sa.Integer,
+        nullable=False,
+        default=1,
+        server_default="1",
+    )
+    reporter_last_read_created_at: Mapped[Optional[datetime]] = mapped_column(
+        sa.DateTime(timezone=True),
+        nullable=True,
+    )
+    reporter_last_read_message_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        sa.Uuid(as_uuid=True),
+        sa.ForeignKey("case_messages.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         sa.DateTime(timezone=True),
         server_default=sa.func.now(),
@@ -115,4 +136,15 @@ class Report(Base):
         "Moderator",
         back_populates="assigned_reports",
         foreign_keys=[assigned_to],
+    )
+    messages: Mapped[List["CaseMessage"]] = relationship(
+        "CaseMessage",
+        back_populates="report",
+        cascade="all, delete-orphan",
+        foreign_keys="CaseMessage.report_id",
+    )
+    moderator_read_states: Mapped[List["CaseMessageModeratorReadState"]] = relationship(
+        "CaseMessageModeratorReadState",
+        back_populates="report",
+        cascade="all, delete-orphan",
     )

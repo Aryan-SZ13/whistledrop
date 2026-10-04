@@ -1,16 +1,37 @@
 import logging
 from typing import List, Optional
-from fastapi import APIRouter, Depends, File, Header, HTTPException, Path, Request, UploadFile, status
+from fastapi import APIRouter, Depends, File, Header, HTTPException, Path, Query, Request, Response, UploadFile, status
+import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.client_ip import resolve_client_ip
 from app.core.config import settings
+from app.core.security import derive_case_code_digest
 from app.db.session import get_db
+from app.models.enums import MessageSenderType
+from app.models.report import Report
+from app.schemas.case_message import (
+    CaseMessageListResponse,
+    CaseMessageResponse,
+    CaseNotificationResponse,
+    MessageReadAckRequest,
+    MessageReadAckResponse,
+    NotificationStatusAckRequest,
+    NotificationStatusAckResponse,
+)
 from app.schemas.evidence import EvidenceUploadResponse
 from app.schemas.report import (
     ReportCreate,
     ReportCreateResponse,
     ReportTrackingResponse,
+)
+from app.services.case_channel_service import (
+    CaseClosedError,
+    InvalidCursorError,
+    MessageNotFoundError,
+    add_no_store_cache_headers,
+    case_channel_service,
+    read_and_validate_message_payload,
 )
 from app.services.evidence_service import (
     AttachmentQuotaExceededError,
@@ -30,6 +51,68 @@ from app.services.report_service import report_service
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+async def get_authenticated_report_by_header(
+    x_case_code: Optional[str],
+    db: AsyncSession,
+) -> Report:
+    """Validate X-Case-Code header and return matching report. Never logs plaintext case code."""
+    if not x_case_code or not x_case_code.strip():
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Case code credential required",
+        )
+    case_code_digest = derive_case_code_digest(x_case_code.strip())
+    stmt = sa.select(Report).where(Report.case_code_digest == case_code_digest)
+    res = await db.execute(stmt)
+    report = res.scalar_one_or_none()
+    if not report:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Report not found",
+        )
+    return report
+
+
+async def check_channel_rate_limit(
+    request: Request,
+    report: Report,
+    key_prefix: str,
+    limit: int,
+    window: int,
+) -> None:
+    """Atomic dual-policy rate limiting across client IP and case credential."""
+    client_ip = resolve_client_ip(request)
+    try:
+        client_policy = RateLimitPolicy(
+            key_prefix=f"{key_prefix}_client",
+            max_requests=limit,
+            window_seconds=window,
+        )
+        case_policy = RateLimitPolicy(
+            key_prefix=f"{key_prefix}_case:{report.case_code_digest}",
+            max_requests=limit,
+            window_seconds=window,
+        )
+        limit_result = await rate_limiter.check_multi_rate_limit(
+            client_policy=client_policy,
+            global_policy=case_policy,
+            client_ip=client_ip,
+        )
+    except RateLimitUnavailableError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Rate limiting service unavailable",
+        )
+
+    if not limit_result.allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many requests",
+            headers={"Retry-After": str(limit_result.retry_after)},
+        )
+
 
 
 @router.post(
@@ -173,6 +256,156 @@ async def upload_evidence(
         )
 
 
+@router.post(
+    "/reports/messages",
+    response_model=CaseMessageResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Submit message to anonymous case channel",
+    description="Submit a follow-up message to the case conversation channel.",
+)
+async def post_case_message(
+    request: Request,
+    response: Response,
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+    x_case_code: Optional[str] = Header(None, alias="X-Case-Code"),
+    db: AsyncSession = Depends(get_db),
+) -> CaseMessageResponse:
+    add_no_store_cache_headers(response)
+    report = await get_authenticated_report_by_header(x_case_code, db)
+    await check_channel_rate_limit(
+        request, report, "msg", settings.MESSAGE_RATE_LIMIT, settings.MESSAGE_RATE_WINDOW_SECONDS
+    )
+    content = await read_and_validate_message_payload(request)
+    try:
+        msg, is_recovered = await case_channel_service.create_message(
+            db=db,
+            report_id=report.id,
+            sender_type=MessageSenderType.REPORTER,
+            content=content,
+            idempotency_key=idempotency_key,
+        )
+    except CaseClosedError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+
+    if is_recovered:
+        response.headers["X-Cache-Lookup"] = "HIT"
+
+    return CaseMessageResponse(
+        id=msg.public_id,
+        sender=msg.sender_type.value,
+        content=msg.content,
+        created_at=msg.created_at,
+    )
+
+
+@router.get(
+    "/reports/messages",
+    response_model=CaseMessageListResponse,
+    status_code=status.HTTP_200_OK,
+    summary="List anonymous case messages",
+    description="Retrieve cursor-paginated messages for the case conversation.",
+)
+async def list_case_messages(
+    request: Request,
+    response: Response,
+    cursor: Optional[str] = Query(None, max_length=512),
+    limit: int = Query(20, ge=1, le=100),
+    x_case_code: Optional[str] = Header(None, alias="X-Case-Code"),
+    db: AsyncSession = Depends(get_db),
+) -> CaseMessageListResponse:
+    add_no_store_cache_headers(response)
+    report = await get_authenticated_report_by_header(x_case_code, db)
+    await check_channel_rate_limit(
+        request, report, "msg_list", settings.MESSAGE_RATE_LIMIT, settings.MESSAGE_RATE_WINDOW_SECONDS
+    )
+    try:
+        return await case_channel_service.list_messages(
+            db=db,
+            report_id=report.id,
+            cursor=cursor,
+            limit=limit,
+            caller_sender_type=MessageSenderType.REPORTER,
+        )
+    except InvalidCursorError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
+
+
+@router.post(
+    "/reports/messages/read",
+    response_model=MessageReadAckResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Acknowledge message read state",
+    description="Monotonically advance the whistleblower message read high-water mark.",
+)
+async def acknowledge_reporter_messages_read(
+    request: Request,
+    response: Response,
+    read_req: MessageReadAckRequest,
+    x_case_code: Optional[str] = Header(None, alias="X-Case-Code"),
+    db: AsyncSession = Depends(get_db),
+) -> MessageReadAckResponse:
+    add_no_store_cache_headers(response)
+    report = await get_authenticated_report_by_header(x_case_code, db)
+    await check_channel_rate_limit(
+        request, report, "msg_read", settings.MESSAGE_RATE_LIMIT, settings.MESSAGE_RATE_WINDOW_SECONDS
+    )
+    try:
+        return await case_channel_service.advance_reporter_read_state(
+            db=db,
+            report_id=report.id,
+            public_message_id=read_req.last_read_message_id,
+        )
+    except MessageNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
+
+@router.get(
+    "/reports/notifications",
+    response_model=CaseNotificationResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Poll case notification status",
+    description="Pull-based check for unread messages and lifecycle status updates.",
+)
+async def get_case_notifications(
+    request: Request,
+    response: Response,
+    x_case_code: Optional[str] = Header(None, alias="X-Case-Code"),
+    db: AsyncSession = Depends(get_db),
+) -> CaseNotificationResponse:
+    add_no_store_cache_headers(response)
+    report = await get_authenticated_report_by_header(x_case_code, db)
+    await check_channel_rate_limit(
+        request, report, "notif", settings.NOTIFICATION_RATE_LIMIT, settings.NOTIFICATION_RATE_WINDOW_SECONDS
+    )
+    return await case_channel_service.get_case_notifications(db=db, report=report)
+
+
+@router.post(
+    "/reports/notifications/read",
+    response_model=NotificationStatusAckResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Acknowledge case status notification",
+    description="Monotonically acknowledge observed case status version.",
+)
+async def acknowledge_notification_status(
+    request: Request,
+    response: Response,
+    ack_req: NotificationStatusAckRequest,
+    x_case_code: Optional[str] = Header(None, alias="X-Case-Code"),
+    db: AsyncSession = Depends(get_db),
+) -> NotificationStatusAckResponse:
+    add_no_store_cache_headers(response)
+    report = await get_authenticated_report_by_header(x_case_code, db)
+    await check_channel_rate_limit(
+        request, report, "notif_read", settings.NOTIFICATION_RATE_LIMIT, settings.NOTIFICATION_RATE_WINDOW_SECONDS
+    )
+    return await case_channel_service.acknowledge_notification_status(
+        db=db,
+        report_id=report.id,
+        status_version=ack_req.status_version,
+    )
+
+
 @router.get(
     "/reports/{case_code}",
     response_model=ReportTrackingResponse,
@@ -186,6 +419,7 @@ async def upload_evidence(
 )
 async def track_report(
     request: Request,
+    response: Response,
     case_code: str = Path(
         ...,
         min_length=10,
@@ -195,6 +429,7 @@ async def track_report(
     db: AsyncSession = Depends(get_db),
 ) -> ReportTrackingResponse:
     """Endpoint for anonymous report tracking protected by atomic dual-policy rate limiting."""
+    add_no_store_cache_headers(response)
     client_ip = resolve_client_ip(request)
     try:
         client_policy = RateLimitPolicy(

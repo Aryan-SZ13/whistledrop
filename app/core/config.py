@@ -5,9 +5,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 DEV_INSECURE_JWT_SECRET = "dev-insecure-jwt-secret-key-change-in-production-min32bytes"
 DEV_INSECURE_CASE_CODE_SECRET = "dev-insecure-case-code-secret-key-change-in-production-min32bytes"
 DEV_INSECURE_RATE_LIMIT_KEY_SECRET = "dev-insecure-rate-limit-key-secret-change-in-production-min32"
+DEV_INSECURE_CURSOR_SECRET = "dev-insecure-cursor-secret-key-change-in-production-min32bytes"
 ENV_EXAMPLE_PLACEHOLDER_JWT = "replace-with-a-secure-random-secret-for-jwt-tokens-minimum-32-chars"
 ENV_EXAMPLE_PLACEHOLDER_CASE = "replace-with-a-secure-random-secret-for-case-codes-minimum-32-chars"
 ENV_EXAMPLE_PLACEHOLDER_RATE_LIMIT = "replace-with-a-secure-random-secret-for-rate-limit-keys-min-32"
+ENV_EXAMPLE_PLACEHOLDER_CURSOR = "replace-with-a-secure-random-secret-for-cursor-signing-minimum-32"
 
 DEFAULT_DEV_CORS_ORIGINS: List[str] = [
     "http://localhost:3000",
@@ -30,6 +32,7 @@ class Settings(BaseSettings):
     JWT_SECRET: str = DEV_INSECURE_JWT_SECRET
     CASE_CODE_SECRET: str = DEV_INSECURE_CASE_CODE_SECRET
     RATE_LIMIT_KEY_SECRET: str = DEV_INSECURE_RATE_LIMIT_KEY_SECRET
+    CURSOR_SECRET: str = DEV_INSECURE_CURSOR_SECRET
     JWT_ALGORITHM: str = "HS256"
     JWT_ISSUER: str = "whistledrop-api"
     JWT_AUDIENCE: str = "whistledrop-moderators"
@@ -54,6 +57,16 @@ class Settings(BaseSettings):
 
     LOGIN_RATE_LIMIT: int = 5
     LOGIN_RATE_WINDOW_SECONDS: int = 300
+
+    # Anonymous Communication & Notification Policies (Phase 11 & 12)
+    MAX_MESSAGE_LENGTH: int = 5000
+    MAX_MESSAGE_REQUEST_BODY: int = 65536  # 64 KiB transport-level ceiling
+    MESSAGE_RATE_LIMIT: int = 15
+    MESSAGE_RATE_WINDOW_SECONDS: int = 60
+    NOTIFICATION_RATE_LIMIT: int = 30
+    NOTIFICATION_RATE_WINDOW_SECONDS: int = 60
+    IDEMPOTENCY_TTL_SECONDS: int = 86400  # 24 hours
+    IDEMPOTENCY_IN_PROGRESS_TTL_SECONDS: int = 60
 
     # Evidence Attachment Storage & Antivirus Scanning (Phase 8)
     MAX_ATTACHMENT_SIZE_MB: int = 10
@@ -118,6 +131,12 @@ class Settings(BaseSettings):
         "LOGIN_RATE_WINDOW_SECONDS",
         "ATTACHMENT_UPLOAD_RATE_LIMIT",
         "ATTACHMENT_UPLOAD_RATE_WINDOW_SECONDS",
+        "MESSAGE_RATE_LIMIT",
+        "MESSAGE_RATE_WINDOW_SECONDS",
+        "NOTIFICATION_RATE_LIMIT",
+        "NOTIFICATION_RATE_WINDOW_SECONDS",
+        "IDEMPOTENCY_TTL_SECONDS",
+        "IDEMPOTENCY_IN_PROGRESS_TTL_SECONDS",
     )
     @classmethod
     def validate_rate_limit_bounds(cls, v: int) -> int:
@@ -133,6 +152,8 @@ class Settings(BaseSettings):
         "RECONCILIATION_INTERVAL_MINUTES",
         "CLAMAV_SCAN_TIMEOUT",
         "MIN_FREE_STORAGE_MB",
+        "MAX_MESSAGE_LENGTH",
+        "MAX_MESSAGE_REQUEST_BODY",
     )
     @classmethod
     def validate_positive_bounds(cls, v: int) -> int:
@@ -169,23 +190,35 @@ class Settings(BaseSettings):
             if self.DEBUG is None:
                 self.DEBUG = True
 
-        # 2. Secret Separation & Non-Reuse Verification
-        secrets_set = {self.JWT_SECRET, self.CASE_CODE_SECRET, self.RATE_LIMIT_KEY_SECRET}
-        if len(secrets_set) < 3:
+        # 2. Derive domain-separated CURSOR_SECRET if left as dev placeholder in production
+        if is_production and self.CURSOR_SECRET in (DEV_INSECURE_CURSOR_SECRET, ENV_EXAMPLE_PLACEHOLDER_CURSOR):
+            import hmac
+            import hashlib
+            self.CURSOR_SECRET = hmac.new(
+                self.CASE_CODE_SECRET.encode("utf-8"),
+                b"whistledrop-cursor-secret-domain-separation",
+                hashlib.sha256,
+            ).hexdigest()
+
+        # 3. Secret Separation & Non-Reuse Verification
+        secrets_set = {self.JWT_SECRET, self.CASE_CODE_SECRET, self.RATE_LIMIT_KEY_SECRET, self.CURSOR_SECRET}
+        if len(secrets_set) < 4:
             raise ValueError(
-                "JWT_SECRET, CASE_CODE_SECRET, and RATE_LIMIT_KEY_SECRET must be distinct secrets. "
+                "JWT_SECRET, CASE_CODE_SECRET, RATE_LIMIT_KEY_SECRET, and CURSOR_SECRET must be distinct secrets. "
                 "Do NOT reuse the same secret across different security contexts."
             )
 
-        # 3. Production Secret Hardening
+        # 4. Production Secret Hardening
         if is_production:
             insecure_placeholders = {
                 DEV_INSECURE_JWT_SECRET,
                 DEV_INSECURE_CASE_CODE_SECRET,
                 DEV_INSECURE_RATE_LIMIT_KEY_SECRET,
+                DEV_INSECURE_CURSOR_SECRET,
                 ENV_EXAMPLE_PLACEHOLDER_JWT,
                 ENV_EXAMPLE_PLACEHOLDER_CASE,
                 ENV_EXAMPLE_PLACEHOLDER_RATE_LIMIT,
+                ENV_EXAMPLE_PLACEHOLDER_CURSOR,
             }
             if self.JWT_SECRET in insecure_placeholders or len(self.JWT_SECRET) < 32:
                 raise ValueError(
@@ -198,6 +231,10 @@ class Settings(BaseSettings):
             if self.RATE_LIMIT_KEY_SECRET in insecure_placeholders or len(self.RATE_LIMIT_KEY_SECRET) < 32:
                 raise ValueError(
                     "Production requires a strong, unique RATE_LIMIT_KEY_SECRET of at least 32 characters."
+                )
+            if self.CURSOR_SECRET in insecure_placeholders or len(self.CURSOR_SECRET) < 32:
+                raise ValueError(
+                    "Production requires a strong, unique CURSOR_SECRET of at least 32 characters."
                 )
 
         # 4. CORS Behavior

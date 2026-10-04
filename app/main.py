@@ -99,7 +99,7 @@ if settings.BACKEND_CORS_ORIGINS:
         allow_origins=settings.BACKEND_CORS_ORIGINS,
         allow_credentials=False,
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type", "Accept", "X-Case-Code", "X-Request-ID"],
+        allow_headers=["Authorization", "Content-Type", "Accept", "X-Case-Code", "X-Request-ID", "Idempotency-Key"],
     )
 
 # Top-level operational endpoints for root probes / orchestrators
