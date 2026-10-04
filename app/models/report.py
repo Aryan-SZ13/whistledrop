@@ -5,12 +5,13 @@ import sqlalchemy as sa
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base
-from app.models.enums import ReportCategory, ReportStatus
+from app.models.enums import ReportCategory, ReportPriority, ReportStatus
 
 if TYPE_CHECKING:
     from app.models.report_update import ReportUpdate
     from app.models.audit_log import AuditLog
     from app.models.evidence import EvidenceAttachment
+    from app.models.moderator import Moderator
 
 
 class Report(Base):
@@ -56,6 +57,30 @@ class Report(Base):
         default=ReportStatus.SUBMITTED,
         index=True,
     )
+    priority: Mapped[ReportPriority] = mapped_column(
+        sa.Enum(
+            ReportPriority,
+            name="report_priority_enum",
+            native_enum=True,
+            values_callable=lambda obj: [e.value for e in obj],
+        ),
+        nullable=False,
+        default=ReportPriority.MEDIUM,
+        server_default="MEDIUM",
+        index=True,
+    )
+    assigned_to: Mapped[Optional[uuid.UUID]] = mapped_column(
+        sa.Uuid(as_uuid=True),
+        sa.ForeignKey("moderators.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    version_id: Mapped[int] = mapped_column(
+        sa.Integer,
+        nullable=False,
+        default=1,
+        server_default="1",
+    )
     created_at: Mapped[datetime] = mapped_column(
         sa.DateTime(timezone=True),
         server_default=sa.func.now(),
@@ -85,4 +110,9 @@ class Report(Base):
         "EvidenceAttachment",
         back_populates="report",
         cascade="all, delete-orphan",
+    )
+    assignee: Mapped[Optional["Moderator"]] = relationship(
+        "Moderator",
+        back_populates="assigned_reports",
+        foreign_keys=[assigned_to],
     )

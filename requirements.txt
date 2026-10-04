@@ -28,3 +28,6 @@ redis[hiredis]==8.1.0
 python-magic==0.4.27
 python-multipart==0.0.32
 
+# Production Observability & Metrics (Phase 9)
+prometheus-client==0.21.1
+

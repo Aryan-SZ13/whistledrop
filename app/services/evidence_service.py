@@ -14,6 +14,7 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
 
 from app.core.config import settings
+from app.core.metrics import evidence_scans_total, reconciliation_runs_total
 from app.db.session import async_engine
 from app.models.audit_log import AuditLog
 from app.models.enums import EvidenceScanStatus, ReportStatus
@@ -24,6 +25,47 @@ from app.services.clamav_service import clamav_service
 logger = logging.getLogger(__name__)
 
 RECONCILIATION_LOCK_ID = 428910482910
+
+
+class ReconciliationWorkerStatus:
+    """Tracks background reconciliation worker heartbeats and execution health."""
+
+    def __init__(self):
+        self.last_run_started: Optional[datetime] = None
+        self.last_run_completed: Optional[datetime] = None
+        self.last_success: Optional[datetime] = None
+        self.last_error: Optional[str] = None
+        self.is_running: bool = False
+
+    def record_start(self) -> None:
+        self.last_run_started = datetime.now(timezone.utc)
+        self.is_running = True
+
+    def record_success(self) -> None:
+        now = datetime.now(timezone.utc)
+        self.last_run_completed = now
+        self.last_success = now
+        self.last_error = None
+        self.is_running = False
+
+    def record_failure(self, error: str) -> None:
+        now = datetime.now(timezone.utc)
+        self.last_run_completed = now
+        self.last_error = error
+        self.is_running = False
+
+    def is_healthy(self, max_lag_seconds: int = 7200) -> bool:
+        """Verify the worker has executed recently and is not stalled with an unhandled error."""
+        if self.last_success is None:
+            # If during initial startup within 120s, consider healthy
+            if self.last_run_started and (datetime.now(timezone.utc) - self.last_run_started).total_seconds() < 120:
+                return True
+            return False
+        lag = (datetime.now(timezone.utc) - self.last_success).total_seconds()
+        return lag <= max_lag_seconds and self.last_error is None
+
+
+reconciliation_worker_status = ReconciliationWorkerStatus()
 
 # 6 Explicitly allowed file types
 ALLOWED_EXTENSIONS = {
@@ -490,10 +532,34 @@ class EvidenceService:
                     )
                     await db.execute(stmt)
                     await db.commit()
+                    evidence_scans_total.labels(result="failed").inc()
                     return
 
-                # Step 6: Commit DB -> CLEAN
+                # Step 6: Commit DB -> CLEAN and bump Report version_id
                 stmt = (
+                    sa.update(EvidenceAttachment)
+                    .where(EvidenceAttachment.id == attachment_id)
+                    .values(
+                        scan_status=EvidenceScanStatus.SCAN_CLEAN,
+                        updated_at=datetime.now(timezone.utc),
+                    )
+                )
+                # Fetch parent report_id
+                rep_res = await db.execute(
+                    sa.select(EvidenceAttachment.report_id).where(EvidenceAttachment.id == attachment_id)
+                )
+                parent_report_id = rep_res.scalar_one_or_none()
+                if parent_report_id:
+                    await db.execute(
+                        sa.update(Report)
+                        .where(Report.id == parent_report_id)
+                        .values(
+                            version_id=Report.version_id + 1,
+                            updated_at=datetime.now(timezone.utc),
+                        )
+                    )
+
+                stmt_clean = (
                     sa.update(EvidenceAttachment)
                     .where(EvidenceAttachment.id == attachment_id)
                     .values(
@@ -501,8 +567,9 @@ class EvidenceService:
                         updated_at=datetime.now(timezone.utc),
                     )
                 )
-                await db.execute(stmt)
+                await db.execute(stmt_clean)
                 await db.commit()
+                evidence_scans_total.labels(result="clean").inc()
                 logger.info("Evidence attachment %s promoted to approved (CLEAN).", attachment_id)
 
             except Exception as e:
@@ -517,6 +584,7 @@ class EvidenceService:
                 )
                 await db.execute(stmt)
                 await db.commit()
+                evidence_scans_total.labels(result="failed").inc()
 
         elif scan_result == "FOUND":
             # Infected: unlink quarantine file and update status to INFECTED
@@ -537,6 +605,7 @@ class EvidenceService:
             )
             await db.execute(stmt)
             await db.commit()
+            evidence_scans_total.labels(result="infected").inc()
             logger.warning("Evidence attachment %s marked INFECTED and quarantine file deleted.", attachment_id)
 
         else:
@@ -552,6 +621,7 @@ class EvidenceService:
             )
             await db.execute(stmt)
             await db.commit()
+            evidence_scans_total.labels(result="failed").inc()
             logger.warning("Evidence attachment %s scan failed: detail=%s", attachment_id, detail)
 
     async def list_evidence_for_report(
@@ -604,7 +674,7 @@ class EvidenceService:
 
         approved_file = self.approved_dir / f"{attachment.storage_key}.bin"
         if not approved_file.is_file():
-            logger.critical("Data loss: Approved evidence file missing on disk: %s", approved_file)
+            logger.critical("Data loss: Approved evidence file missing on disk for attachment %s", attachment.id)
             raise EvidenceNotFoundError("Evidence file not found on disk.")
 
         # Determine synthetic filename from index
@@ -643,6 +713,7 @@ class EvidenceService:
                 return
 
             try:
+                reconciliation_worker_status.record_start()
                 logger.info("Acquired reconciliation session advisory lock; executing reconciliation.")
 
                 # 2. Reconcile DB-known rows: PENDING_SCAN > 24 hours -> SCAN_FAILED
@@ -861,7 +932,13 @@ class EvidenceService:
                         )
                     )
                 await conn.commit()
+                reconciliation_worker_status.record_success()
+                reconciliation_runs_total.labels(status="success").inc()
 
+            except Exception as e:
+                reconciliation_worker_status.record_failure(str(e))
+                reconciliation_runs_total.labels(status="failure").inc()
+                raise
             finally:
                 # 7. Release advisory lock on the exact same connection
                 try:

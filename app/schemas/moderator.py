@@ -1,15 +1,49 @@
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 import uuid
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.models.enums import ReportCategory, ReportStatus, ReportUpdateType
+from app.models.enums import ReportCategory, ReportPriority, ReportStatus, ReportUpdateType
 
 
 class ReportStatusUpdateRequest(BaseModel):
     """Payload for updating a report lifecycle status."""
 
     status: ReportStatus = Field(..., description="Target lifecycle status")
+    expected_version: int = Field(..., ge=1, description="Expected report version_id for OCC")
+    reopen_reason: Optional[str] = Field(
+        None,
+        min_length=10,
+        max_length=1000,
+        description="Mandatory justification when reopening a closed or dismissed report (min 10 chars)",
+    )
+
+    model_config = ConfigDict(
+        extra="forbid",
+        str_strip_whitespace=True,
+    )
+
+
+class ReportPriorityUpdateRequest(BaseModel):
+    """Payload for updating a report priority level."""
+
+    priority: ReportPriority = Field(..., description="Target priority level")
+    expected_version: int = Field(..., ge=1, description="Expected report version_id for OCC")
+
+    model_config = ConfigDict(
+        extra="forbid",
+        str_strip_whitespace=True,
+    )
+
+
+class ReportAssignmentUpdateRequest(BaseModel):
+    """Payload for assigning or unassigning a report."""
+
+    moderator_id: Optional[uuid.UUID] = Field(
+        None,
+        description="UUID of moderator to assign, or null to unassign",
+    )
+    expected_version: int = Field(..., ge=1, description="Expected report version_id for OCC")
 
     model_config = ConfigDict(
         extra="forbid",
@@ -30,6 +64,7 @@ class ModeratorUpdateCreate(BaseModel):
         ...,
         description="Update visibility type: PUBLIC_UPDATE or INTERNAL_NOTE",
     )
+    expected_version: int = Field(..., ge=1, description="Expected report version_id for OCC")
 
     model_config = ConfigDict(
         extra="forbid",
@@ -64,10 +99,13 @@ class ModeratorReportResponse(BaseModel):
     description: str = Field(..., description="Report incident description")
     evidence_url: Optional[str] = Field(None, description="Metadata evidence URL if submitted")
     status: ReportStatus = Field(..., description="Current report lifecycle status")
+    priority: ReportPriority = Field(..., description="Case priority level")
+    assigned_to: Optional[uuid.UUID] = Field(None, description="Assigned moderator UUID")
+    version_id: int = Field(..., description="Current OCC version ID")
     created_at: datetime = Field(..., description="Timestamp of report submission")
     updated_at: datetime = Field(..., description="Timestamp of last status or update modification")
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", from_attributes=True)
 
 
 class ModeratorReportDetailResponse(ModeratorReportResponse):
@@ -78,7 +116,7 @@ class ModeratorReportDetailResponse(ModeratorReportResponse):
         description="Chronological public updates and internal notes posted to this report",
     )
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", from_attributes=True)
 
 
 class ModeratorReportListResponse(BaseModel):
@@ -88,6 +126,50 @@ class ModeratorReportListResponse(BaseModel):
     total: int = Field(..., ge=0, description="Total matching report count")
     limit: int = Field(..., ge=1, le=100, description="Page size limit")
     offset: int = Field(..., ge=0, description="Offset index")
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class TimelineEventResponse(BaseModel):
+    """Privileged timeline event item."""
+
+    id: uuid.UUID = Field(..., description="Unique event or entity UUID")
+    timestamp: datetime = Field(..., description="Event timestamp (ISO 8601)")
+    event_type: str = Field(..., description="Normalized event type (e.g. STATUS_CHANGED, NOTE_ADDED)")
+    actor_role: Optional[str] = Field(None, description="Role of the actor (MODERATOR, ADMIN, SYSTEM)")
+    actor_username: Optional[str] = Field(None, description="Username of the actor if applicable")
+    summary: str = Field(..., description="Human-readable event summary")
+    metadata: Optional[Dict[str, Any]] = Field(default=None, description="Safe event metadata")
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class TimelineListResponse(BaseModel):
+    """Cursor-paginated unified case activity timeline response."""
+
+    items: List[TimelineEventResponse] = Field(..., description="Chronological timeline events in reverse order")
+    next_cursor: Optional[str] = Field(None, description="Opaque Base64URL pagination cursor for next page")
+    total: int = Field(..., ge=0, description="Total events in timeline for this report")
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class DashboardStatsResponse(BaseModel):
+    """Consolidated case management dashboard aggregate metrics."""
+
+    count_submitted: int = Field(..., ge=0, description="Reports in SUBMITTED state")
+    count_under_review: int = Field(..., ge=0, description="Reports in UNDER_REVIEW state")
+    count_resolved: int = Field(..., ge=0, description="Reports in RESOLVED state")
+    count_dismissed: int = Field(..., ge=0, description="Reports in DISMISSED state")
+
+    priority_low: int = Field(..., ge=0, description="Reports with LOW priority")
+    priority_medium: int = Field(..., ge=0, description="Reports with MEDIUM priority")
+    priority_high: int = Field(..., ge=0, description="Reports with HIGH priority")
+    priority_critical: int = Field(..., ge=0, description="Reports with CRITICAL priority")
+
+    unassigned_active: int = Field(..., ge=0, description="Active reports (SUBMITTED/UNDER_REVIEW) unassigned")
+    my_active_cases: int = Field(..., ge=0, description="Active reports assigned to calling moderator")
+    assigned_to_inactive_count: int = Field(..., ge=0, description="Active reports assigned to deactivated moderators")
 
     model_config = ConfigDict(extra="forbid")
 

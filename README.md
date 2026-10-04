@@ -28,6 +28,9 @@ whistledrop/
 │   │   ├── __init__.py
 │   │   ├── client_ip.py      # Socket-peer trust verification and IP normalization
 │   │   ├── config.py         # Type-safe settings, secret validation, environment logic
+│   │   ├── logging.py        # Structured JSON logging with redaction & zero-IP formatting
+│   │   ├── metrics.py        # Low-cardinality Prometheus telemetry & multiprocess collectors
+│   │   ├── middleware.py     # Request ID, privacy-safe access logging & metric collectors
 │   │   └── security.py       # Argon2id password hashing, JWT tokens, CSPRNG case-codes
 │   ├── db/
 │   │   ├── __init__.py
@@ -36,7 +39,7 @@ whistledrop/
 │   ├── models/
 │   │   ├── __init__.py       # Model exports
 │   │   ├── base.py           # DeclarativeBase base model class
-│   │   ├── enums.py          # Domain enums (ReportCategory, ReportStatus, ModeratorRole, ReportUpdateType, EvidenceScanStatus)
+│   │   ├── enums.py          # Domain enums (ReportCategory, ReportStatus, ReportPriority, ModeratorRole, ReportUpdateType, EvidenceScanStatus)
 │   │   ├── moderator.py      # Moderator accounts and roles
 │   │   ├── report.py         # Core whistleblower report schema
 │   │   ├── report_update.py  # Moderator case status updates and internal notes
@@ -45,7 +48,7 @@ whistledrop/
 │   ├── schemas/
 │   │   ├── __init__.py       # Pydantic schemas export
 │   │   ├── auth.py           # Moderator login and token schemas
-│   │   ├── moderator.py      # Moderator report listing, status update, and note schemas
+│   │   ├── moderator.py      # Moderator report listing, status update, priority, assignment, timeline & stats schemas
 │   │   ├── report.py         # Public request and response schemas
 │   │   └── evidence.py       # Evidence upload and moderator view schemas
 │   ├── services/
@@ -53,7 +56,7 @@ whistledrop/
 │   │   ├── auth_service.py   # Moderator authentication, hashing, and token issuance
 │   │   ├── clamav_service.py # Asynchronous ClamAV client via INSTREAM protocol
 │   │   ├── evidence_service.py # Validation, storage, atomic promotion, and reconciliation
-│   │   ├── moderator_service.py # Protected report querying, filtering, and status transitions
+│   │   ├── moderator_service.py # Case triage, mandatory OCC, assignment, priority, timeline, and stats
 │   │   ├── rate_limiter.py   # Redis sliding-window rate limiter with atomic Lua scripts
 │   │   └── report_service.py # Core business logic for report submission and tracking
 │   └── api/
@@ -65,8 +68,8 @@ whistledrop/
 │           └── endpoints/
 │               ├── __init__.py
 │               ├── auth.py   # Moderator authentication endpoints (rate limited)
-│               ├── health.py # Health check probe endpoint
-│               ├── moderator.py # Protected moderator report & evidence management routes
+│               ├── health.py # Health check, readiness probe, and authenticated metrics endpoints
+│               ├── moderator.py # Protected moderator case management & evidence routes
 │               └── reports.py# Anonymous report submission, evidence upload & tracking endpoints
 └── tests/
     ├── __init__.py
@@ -78,6 +81,8 @@ whistledrop/
     ├── test_evidence_config.py # Evidence configuration bounds and cross-field checks
     ├── test_health.py        # Health and root endpoint tests
     ├── test_moderator.py     # Protected moderator control plane & lifecycle tests
+    ├── test_moderator_advanced.py # Phase 10: Mandatory OCC, priority, assignment, timeline, dashboard stats
+    ├── test_observability.py # Phase 9: JSON logs, request IDs, zero-IP logging, /ready, /metrics auth
     ├── test_rate_limiting.py # Sliding-window rate limiting, privacy, proxy, and outage tests
     ├── test_reports.py       # Report creation, validation, and crypto regression tests
     └── test_tracking.py      # Public case tracking, isolation, and minimization tests
@@ -356,6 +361,67 @@ To maintain consistency across process crashes or scanner latency:
 
 ---
 
+## Observability & Reliability (Phase 9)
+
+WhistleDrop features a hardened production observability stack designed for maximum visibility without sacrificing whistleblower privacy:
+
+1. **Structured JSON Application Logging:**
+   - Log records are rendered as machine-readable JSON with standardized fields: `timestamp`, `level`, `logger`, `message`, `request_id`, `http_method`, `path`, `status_code`, `duration_ms`.
+   - **Zero Client IP Policy:** Client IP addresses (`client_ip`) and client IP hashes (`client_ip_hash`) are strictly excluded from all access logs and application logs to preserve submitter anonymity.
+   - **Regex Secret Redaction:** Log records pass through `RegexRedactionFilter` that masks case codes (`wdc_[a-zA-Z0-9_-]{20,}` -> `[REDACTED_CASE_CODE]`), JWTs, Bearer tokens, and password fields before reaching standard output.
+2. **Request & Correlation Tracking:**
+   - `RequestIDMiddleware` generates a cryptographically secure UUIDv4 for incoming requests, or validates client-provided `X-Request-ID` headers against canonical UUIDv4 format (`^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`). Invalid headers are discarded and replaced.
+   - Injected into Python logging context via `contextvars` and propagated outbound in `X-Request-ID` response headers.
+3. **Health & Readiness Probes:**
+   - **Liveness (`GET /health` and `GET /api/v1/health`):** Lightweight check returning `200 OK` (`{"status": "ok", "app": "whistledrop", "version": "0.1.0"}`).
+   - **Readiness (`GET /ready` and `GET /api/v1/ready`):** Deep dependency probe checking PostgreSQL, Redis, ClamAV, and background reconciliation worker heartbeat (`RECONCILIATION_STALE_THRESHOLD_MINUTES = 120`). Returns `200 OK` (`{"status": "ready"}`) or `503 Service Unavailable` (`{"status": "not_ready"}`). Dependency diagnostic details are logged internally with redacted failure reasons and never leaked in HTTP response bodies.
+4. **Prometheus Metrics Telemetry:**
+   - Scrape endpoint: `GET /metrics` and `GET /api/v1/metrics`.
+   - **Strict Authorization Boundary:** Accessible strictly by authenticated administrators verified via database record (`Moderator.role == ADMIN`). Unauthenticated requests receive `401 Unauthorized`; non-admin moderators receive `403 Forbidden`.
+   - **Low-Cardinality Label Normalization:** Route paths are normalized to parameterized route templates (e.g. `/reports/{case_code}`, `/{id}`) to eliminate label cardinality explosion and prevent sensitive identifiers from leaking into metric series.
+   - **Key Metrics Tracked:**
+     - `http_requests_total` & `http_request_duration_seconds`
+     - `dependency_healthy` (PostgreSQL, Redis, ClamAV, Reconciliation Worker)
+     - `rate_limit_rejections_total`
+     - `evidence_scans_total` & `reconciliation_runs_total`
+     - `moderator_actions_total`
+
+---
+
+## Advanced Moderator Case Management (Phase 10)
+
+WhistleDrop provides an enterprise-grade case triage and management plane:
+
+1. **Mandatory Optimistic Concurrency Control (OCC):**
+   - The `Report` model tracks a monotonically increasing integer `version_id` (starts at 1).
+   - All mutating moderator endpoints require an explicit `expected_version: int` in request payloads:
+     - `PATCH /api/v1/moderator/reports/{id}/status`
+     - `PATCH /api/v1/moderator/reports/{id}/priority`
+     - `PATCH /api/v1/moderator/reports/{id}/assignment`
+     - `POST /api/v1/moderator/reports/{id}/updates` (with `update_type: PUBLIC_UPDATE`)
+     - `POST /api/v1/moderator/reports/{id}/updates` (with `update_type: INTERNAL_NOTE`)
+   - Clean evidence promotions also atomically increment the report's `version_id`.
+   - Missing `expected_version` fails with `422 Unprocessable Content`. Mismatched version fails closed with `409 Conflict` and returns `{"detail": "Conflict: Report version mismatch", "current_version": <current>}`.
+2. **Report Priority & Assignment:**
+   - Priority levels: `LOW`, `MEDIUM`, `HIGH`, `CRITICAL` (defaults to `MEDIUM`).
+   - Assignment: Reports can be assigned to active moderators (`assigned_to: UUID` or `null` to unassign).
+   - Reassignment protection: If a case is already assigned to another active moderator, reassigning or unassigning requires `ADMIN` privileges (regular moderators cannot steal active cases). Assigning to inactive moderators is rejected with `400 Bad Request`.
+3. **Admin-Only Case Reopening:**
+   - Reopening a terminal case (`RESOLVED`, `DISMISSED`) requires `ADMIN` role and a mandatory explanation (`reopen_reason`, minimum 10 characters). Non-admins attempting to reopen closed cases receive `403 Forbidden`.
+4. **Unified Case Timeline with Cursor Pagination:**
+   - Endpoint: `GET /api/v1/moderator/reports/{id}/timeline`
+   - Blends status transitions, public updates, internal notes, evidence attachment uploads, priority updates, and assignments in deterministic reverse-chronological order (`event_timestamp DESC, event_id DESC`).
+   - Uses opaque base64-encoded cursor pagination (`limit` capped at 100).
+5. **Multi-Field Search, Filtering, and Deterministic Sorting:**
+   - Endpoint: `GET /api/v1/moderator/reports`
+   - Supports search across report title and description with safe wildcard escaping (`%`, `_`), and filtering by `status`, `category`, `priority`, and `assigned_to` (`me`, `unassigned`, or specific UUID).
+   - Deterministic sorting by `created_at`, `updated_at`, or `priority` (`asc`/`desc`).
+6. **Dashboard Statistics:**
+   - Endpoint: `GET /api/v1/moderator/dashboard/stats`
+   - Consolidated single SQL query aggregating total cases, breakdown by status and priority, unassigned active count, currently assigned cases for caller (`my_active_cases`), and cases assigned to inactive moderators.
+
+---
+
 ## Development Roadmap
 
 - [x] **Phase 0:** Backend Foundation, Configuration & Health Check
@@ -372,6 +438,8 @@ To maintain consistency across process crashes or scanner latency:
 - [x] **Phase 6.1:** Least-Privilege Moderator Update Query Hardening
 - [x] **Phase 7:** Redis-Backed Abuse Resistance & Sliding-Window Rate Limiting
 - [x] **Phase 8:** Evidence Attachment Storage & Antivirus Scanning (ClamAV)
+- [x] **Phase 9:** Production Observability & Reliability (Structured JSON Logging, Request IDs, Health/Readiness Probes, Authenticated Prometheus Metrics)
+- [x] **Phase 10:** Advanced Moderator Case Management (Mandatory OCC, Priority, Assignment, Cursor-Paginated Timeline, Dashboard Aggregates)
 
 ---
 

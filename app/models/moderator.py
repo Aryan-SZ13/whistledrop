@@ -8,6 +8,7 @@ from app.models.base import Base
 from app.models.enums import ModeratorRole
 
 if TYPE_CHECKING:
+    from app.models.report import Report
     from app.models.report_update import ReportUpdate
     from app.models.audit_log import AuditLog
 
@@ -60,4 +61,9 @@ class Moderator(Base):
     audit_logs: Mapped[List["AuditLog"]] = relationship(
         "AuditLog",
         back_populates="moderator",
+    )
+    assigned_reports: Mapped[List["Report"]] = relationship(
+        "Report",
+        back_populates="assignee",
+        foreign_keys="Report.assigned_to",
     )

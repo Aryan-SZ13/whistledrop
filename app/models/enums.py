@@ -18,6 +18,14 @@ class ReportStatus(str, enum.Enum):
     DISMISSED = "DISMISSED"
 
 
+class ReportPriority(str, enum.Enum):
+    """Severity and urgency classification for whistleblower reports."""
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+    CRITICAL = "CRITICAL"
+
+
 class ReportUpdateType(str, enum.Enum):
     """Visibility types for updates posted to a report."""
     PUBLIC_UPDATE = "PUBLIC_UPDATE"

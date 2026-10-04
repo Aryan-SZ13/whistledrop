@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     PROJECT_NAME: str = "WhistleDrop"
     ENV: str = "development"
     DEBUG: Optional[bool] = None
+    LOG_LEVEL: str = "INFO"
     API_V1_PREFIX: str = "/api/v1"
 
     # Distinct Cryptographic Secrets & JWT Configuration

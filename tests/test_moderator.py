@@ -381,6 +381,9 @@ async def test_moderator_query_column_least_privilege(db_session: AsyncSession):
             "description",
             "evidence_url",
             "status",
+            "priority",
+            "assigned_to",
+            "version_id",
             "created_at",
             "updated_at",
         ]
@@ -433,7 +436,7 @@ async def test_state_machine_valid_transitions(client, db_session: AsyncSession)
     res1 = client.patch(
         f"/api/v1/moderator/reports/{r1.id}/status",
         headers=headers,
-        json={"status": "UNDER_REVIEW"},
+        json={"status": "UNDER_REVIEW", "expected_version": 1},
     )
     assert res1.status_code == 200
     assert res1.json()["status"] == "UNDER_REVIEW"
@@ -441,7 +444,7 @@ async def test_state_machine_valid_transitions(client, db_session: AsyncSession)
     res1_resolved = client.patch(
         f"/api/v1/moderator/reports/{r1.id}/status",
         headers=headers,
-        json={"status": "RESOLVED"},
+        json={"status": "RESOLVED", "expected_version": 2},
     )
     assert res1_resolved.status_code == 200
     assert res1_resolved.json()["status"] == "RESOLVED"
@@ -454,14 +457,14 @@ async def test_state_machine_valid_transitions(client, db_session: AsyncSession)
     res2 = client.patch(
         f"/api/v1/moderator/reports/{r2.id}/status",
         headers=headers,
-        json={"status": "UNDER_REVIEW"},
+        json={"status": "UNDER_REVIEW", "expected_version": 1},
     )
     assert res2.status_code == 200
 
     res2_dismissed = client.patch(
         f"/api/v1/moderator/reports/{r2.id}/status",
         headers=headers,
-        json={"status": "DISMISSED"},
+        json={"status": "DISMISSED", "expected_version": 2},
     )
     assert res2_dismissed.status_code == 200
     assert res2_dismissed.json()["status"] == "DISMISSED"
@@ -469,7 +472,7 @@ async def test_state_machine_valid_transitions(client, db_session: AsyncSession)
 
 @pytest.mark.asyncio
 async def test_state_machine_invalid_transitions_rejected_with_409(client, db_session: AsyncSession):
-    """Verify illegal transitions are rejected with 409 Conflict."""
+    """Verify illegal transitions are rejected with 409 Conflict or 403 Forbidden for non-admin reopen."""
     headers = await create_auth_headers(db_session, role=ModeratorRole.MODERATOR, username="invalid_trans_mod")
 
     # A. SUBMITTED -> RESOLVED (Illegal)
@@ -480,7 +483,7 @@ async def test_state_machine_invalid_transitions_rejected_with_409(client, db_se
     res_direct_res = client.patch(
         f"/api/v1/moderator/reports/{r1.id}/status",
         headers=headers,
-        json={"status": "RESOLVED"},
+        json={"status": "RESOLVED", "expected_version": 1},
     )
     assert res_direct_res.status_code == 409
     assert "Invalid report lifecycle transition" in res_direct_res.json()["detail"]
@@ -489,7 +492,7 @@ async def test_state_machine_invalid_transitions_rejected_with_409(client, db_se
     res_direct_dism = client.patch(
         f"/api/v1/moderator/reports/{r1.id}/status",
         headers=headers,
-        json={"status": "DISMISSED"},
+        json={"status": "DISMISSED", "expected_version": 1},
     )
     assert res_direct_dism.status_code == 409
 
@@ -497,12 +500,12 @@ async def test_state_machine_invalid_transitions_rejected_with_409(client, db_se
     client.patch(
         f"/api/v1/moderator/reports/{r1.id}/status",
         headers=headers,
-        json={"status": "UNDER_REVIEW"},
+        json={"status": "UNDER_REVIEW", "expected_version": 1},
     )
     res_back = client.patch(
         f"/api/v1/moderator/reports/{r1.id}/status",
         headers=headers,
-        json={"status": "SUBMITTED"},
+        json={"status": "SUBMITTED", "expected_version": 2},
     )
     assert res_back.status_code == 409
 
@@ -510,14 +513,14 @@ async def test_state_machine_invalid_transitions_rejected_with_409(client, db_se
     client.patch(
         f"/api/v1/moderator/reports/{r1.id}/status",
         headers=headers,
-        json={"status": "RESOLVED"},
+        json={"status": "RESOLVED", "expected_version": 2},
     )
     res_after_resolved = client.patch(
         f"/api/v1/moderator/reports/{r1.id}/status",
         headers=headers,
-        json={"status": "UNDER_REVIEW"},
+        json={"status": "UNDER_REVIEW", "expected_version": 3},
     )
-    assert res_after_resolved.status_code == 409
+    assert res_after_resolved.status_code in (403, 409)
 
     # E. DISMISSED -> anything (Terminal state)
     r2, _ = await report_service.create_report(
@@ -527,19 +530,19 @@ async def test_state_machine_invalid_transitions_rejected_with_409(client, db_se
     client.patch(
         f"/api/v1/moderator/reports/{r2.id}/status",
         headers=headers,
-        json={"status": "UNDER_REVIEW"},
+        json={"status": "UNDER_REVIEW", "expected_version": 1},
     )
     client.patch(
         f"/api/v1/moderator/reports/{r2.id}/status",
         headers=headers,
-        json={"status": "DISMISSED"},
+        json={"status": "DISMISSED", "expected_version": 2},
     )
     res_after_dismissed = client.patch(
         f"/api/v1/moderator/reports/{r2.id}/status",
         headers=headers,
-        json={"status": "RESOLVED"},
+        json={"status": "RESOLVED", "expected_version": 3},
     )
-    assert res_after_dismissed.status_code == 409
+    assert res_after_dismissed.status_code in (403, 409)
 
 
 @pytest.mark.asyncio
@@ -551,14 +554,14 @@ async def test_status_mutation_auth_boundaries(client, db_session: AsyncSession)
     )
 
     # 1. Unauthenticated -> 401
-    res_unauth = client.patch(f"/api/v1/moderator/reports/{r.id}/status", json={"status": "UNDER_REVIEW"})
+    res_unauth = client.patch(f"/api/v1/moderator/reports/{r.id}/status", json={"status": "UNDER_REVIEW", "expected_version": 1})
     assert res_unauth.status_code == 401
 
     # 2. Invalid JWT -> 401
     res_bad_jwt = client.patch(
         f"/api/v1/moderator/reports/{r.id}/status",
         headers={"Authorization": "Bearer bad.token"},
-        json={"status": "UNDER_REVIEW"},
+        json={"status": "UNDER_REVIEW", "expected_version": 1},
     )
     assert res_bad_jwt.status_code == 401
 
@@ -567,7 +570,7 @@ async def test_status_mutation_auth_boundaries(client, db_session: AsyncSession)
     res_inactive = client.patch(
         f"/api/v1/moderator/reports/{r.id}/status",
         headers=inactive_headers,
-        json={"status": "UNDER_REVIEW"},
+        json={"status": "UNDER_REVIEW", "expected_version": 1},
     )
     assert res_inactive.status_code == 401
 
@@ -576,7 +579,7 @@ async def test_status_mutation_auth_boundaries(client, db_session: AsyncSession)
     res_admin = client.patch(
         f"/api/v1/moderator/reports/{r.id}/status",
         headers=admin_headers,
-        json={"status": "UNDER_REVIEW"},
+        json={"status": "UNDER_REVIEW", "expected_version": 1},
     )
     assert res_admin.status_code == 200
     assert res_admin.json()["status"] == "UNDER_REVIEW"
@@ -598,7 +601,7 @@ async def test_status_mutation_creates_audit_log(client, db_session: AsyncSessio
     res = client.patch(
         f"/api/v1/moderator/reports/{r.id}/status",
         headers=headers,
-        json={"status": "UNDER_REVIEW"},
+        json={"status": "UNDER_REVIEW", "expected_version": 1},
     )
     assert res.status_code == 200
 
@@ -641,7 +644,7 @@ async def test_failed_status_transition_creates_no_audit_log(client, db_session:
     res = client.patch(
         f"/api/v1/moderator/reports/{r.id}/status",
         headers=headers,
-        json={"status": "RESOLVED"},
+        json={"status": "RESOLVED", "expected_version": 1},
     )
     assert res.status_code == 409
 
@@ -679,6 +682,7 @@ async def test_public_update_vs_internal_note_visibility(client, db_session: Asy
         json={
             "message": "We have received and verified your submission.",
             "type": "PUBLIC_UPDATE",
+            "expected_version": 1,
         },
     )
     assert pub_res.status_code == 201
@@ -691,6 +695,7 @@ async def test_public_update_vs_internal_note_visibility(client, db_session: Asy
         json={
             "message": "Internal note: assigned senior analyst Jane Doe for forensic triage.",
             "type": "INTERNAL_NOTE",
+            "expected_version": 2,
         },
     )
     assert note_res.status_code == 201
@@ -736,7 +741,7 @@ async def test_update_creation_creates_audit_log(client, db_session: AsyncSessio
     res = client.post(
         f"/api/v1/moderator/reports/{r.id}/updates",
         headers=headers,
-        json={"message": "Safe update message content", "type": "PUBLIC_UPDATE"},
+        json={"message": "Safe update message content", "type": "PUBLIC_UPDATE", "expected_version": 1},
     )
     assert res.status_code == 201
 
@@ -770,7 +775,7 @@ async def test_moderator_update_validation(client, db_session: AsyncSession):
     res_empty = client.post(
         f"/api/v1/moderator/reports/{r.id}/updates",
         headers=headers,
-        json={"message": "", "type": "PUBLIC_UPDATE"},
+        json={"message": "", "type": "PUBLIC_UPDATE", "expected_version": 1},
     )
     assert res_empty.status_code == 422
 
@@ -778,7 +783,7 @@ async def test_moderator_update_validation(client, db_session: AsyncSession):
     res_oversized = client.post(
         f"/api/v1/moderator/reports/{r.id}/updates",
         headers=headers,
-        json={"message": "A" * 5001, "type": "PUBLIC_UPDATE"},
+        json={"message": "A" * 5001, "type": "PUBLIC_UPDATE", "expected_version": 1},
     )
     assert res_oversized.status_code == 422
 
@@ -786,7 +791,7 @@ async def test_moderator_update_validation(client, db_session: AsyncSession):
     res_extra = client.post(
         f"/api/v1/moderator/reports/{r.id}/updates",
         headers=headers,
-        json={"message": "Valid update", "type": "PUBLIC_UPDATE", "moderator_id": str(uuid.uuid4())},
+        json={"message": "Valid update", "type": "PUBLIC_UPDATE", "expected_version": 1, "moderator_id": str(uuid.uuid4())},
     )
     assert res_extra.status_code == 422
 
@@ -794,7 +799,7 @@ async def test_moderator_update_validation(client, db_session: AsyncSession):
     res_unknown = client.post(
         f"/api/v1/moderator/reports/{uuid.uuid4()}/updates",
         headers=headers,
-        json={"message": "Valid update", "type": "PUBLIC_UPDATE"},
+        json={"message": "Valid update", "type": "PUBLIC_UPDATE", "expected_version": 1},
     )
     assert res_unknown.status_code == 404
     assert res_unknown.json()["detail"] == "Report not found"
@@ -823,6 +828,7 @@ async def test_moderator_detail_updates_query_column_least_privilege(db_session:
         report_id=r.id,
         message="Public update for projection test",
         update_type=ReportUpdateType.PUBLIC_UPDATE,
+        expected_version=1,
         moderator_id=mod.id,
     )
     await moderator_service.add_report_update(
@@ -830,6 +836,7 @@ async def test_moderator_detail_updates_query_column_least_privilege(db_session:
         report_id=r.id,
         message="Internal note for projection test",
         update_type=ReportUpdateType.INTERNAL_NOTE,
+        expected_version=2,
         moderator_id=mod.id,
     )
 
@@ -883,6 +890,7 @@ async def test_public_tracking_updates_query_column_least_privilege(db_session: 
         report_id=r.id,
         message="Public tracking update",
         update_type=ReportUpdateType.PUBLIC_UPDATE,
+        expected_version=1,
         moderator_id=mod.id,
     )
 
