@@ -79,7 +79,6 @@ class CaseExportService:
         latest_hash = latest_audit.entry_hash if latest_audit else ("0" * 64)
 
         receipt_payload = {
-            "report_id": str(report.id),
             "status": report.status.value,
             "sequence_number": seq_no,
             "latest_entry_hash": latest_hash,
@@ -92,7 +91,6 @@ class CaseExportService:
         sig_bytes = priv_key.sign(canonical_bytes)
 
         return ReportVerificationReceiptResponse(
-            report_id=str(report.id),
             status=report.status.value,
             terminal_at=report.terminal_at,
             is_shredded=report.is_shredded,
@@ -104,7 +102,7 @@ class CaseExportService:
             verification_receipt_signature=sig_bytes.hex(),
             verification_instructions=(
                 "Verify Ed25519 signature against the canonical JSON bytes of "
-                "{report_id, status, sequence_number, latest_entry_hash, timestamp, signing_key_id} "
+                "{latest_entry_hash, sequence_number, signing_key_id, status, timestamp} "
                 "using WhistleDrop's documented trust anchor."
             ),
         )
@@ -256,19 +254,21 @@ class CaseExportService:
                     logger.warning("Evidence file missing on disk: %s", att.storage_key)
                     continue
 
-                if att.wrapped_dek:
-                    c_bytes = src_path.read_bytes()
-                    p_bytes = shredder_service.decrypt_evidence_content(
-                        ciphertext=c_bytes,
-                        wrapped_dek=att.wrapped_dek,
-                        dek_nonce=att.dek_nonce,
-                        dek_tag=att.dek_tag,
-                        file_nonce=att.file_nonce,
-                        file_tag=att.file_tag,
-                        kek_key_id=att.kek_key_id,
+                if not att.wrapped_dek or att.shred_status != EvidenceShredStatus.ACTIVE.value:
+                    raise CaseExportError(
+                        f"Evidence attachment {att.id} has been cryptographically erased or is unencrypted."
                     )
-                else:
-                    p_bytes = src_path.read_bytes()
+
+                c_bytes = src_path.read_bytes()
+                p_bytes = shredder_service.decrypt_evidence_content(
+                    ciphertext=c_bytes,
+                    wrapped_dek=att.wrapped_dek,
+                    dek_nonce=att.dek_nonce,
+                    dek_tag=att.dek_tag,
+                    file_nonce=att.file_nonce,
+                    file_tag=att.file_tag,
+                    kek_key_id=att.kek_key_id,
+                )
 
                 # Verify plaintext hash
                 calc_hash = hashlib.sha256(p_bytes).hexdigest()
@@ -346,6 +346,14 @@ class CaseExportService:
 
             return zip_path
 
+        except Exception:
+            if zip_path.is_file():
+                try:
+                    shredder_service.best_effort_shred_file(zip_path)
+                except Exception:
+                    pass
+            raise
+
         finally:
             # Clean up plaintext staged files in session_temp_dir
             try:
@@ -394,6 +402,9 @@ class CaseExportService:
                 key_id = manifest_data.get("signing_key_id")
                 key_fp = manifest_data.get("signing_key_fingerprint")
 
+                if not key_id or key_id != settings.EXPORT_SIGNING_KEY_ID:
+                    errors.append(f"Unknown or unsupported signing_key_id: {key_id}")
+
                 # Public key check: prefer trusted fingerprint list
                 pub_bytes: Optional[bytes] = None
                 if "signing_key.pub" in names:
@@ -423,8 +434,17 @@ class CaseExportService:
                 except Exception as e:
                     errors.append(f"Ed25519 signature verification failed: {e}")
 
-                # Verify files listed in manifest
+                # Check for unexpected files in archive
                 files_dict = manifest_data.get("files", {})
+                declared_files = set(files_dict.keys())
+                allowed_meta_files = {"manifest.json", "manifest.sig", "signing_key.pub"}
+                unexpected_files = names - declared_files - allowed_meta_files
+                if unexpected_files:
+                    errors.append(
+                        f"Unexpected unverified files found in archive: {sorted(list(unexpected_files))}"
+                    )
+
+                # Verify files listed in manifest
                 for rel_path, meta in files_dict.items():
                     if rel_path in ("manifest.json", "manifest.sig", "signing_key.pub"):
                         continue

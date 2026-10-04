@@ -336,8 +336,8 @@ class EvidenceService:
         if report is None:
             raise EvidenceNotFoundError("Report not found.")
 
-        if report.status in (ReportStatus.RESOLVED, ReportStatus.DISMISSED):
-            raise EvidenceError("Cannot attach evidence to a closed or dismissed report.")
+        if report.status in (ReportStatus.RESOLVED, ReportStatus.DISMISSED, ReportStatus.WITHDRAWN) or report.is_shredded:
+            raise EvidenceError("Cannot attach evidence to a closed, dismissed, or withdrawn report.")
 
         # 4. Phase 1: Stream files to quarantine (No DB row lock held during streaming)
         written_attachments: List[Tuple[uuid.UUID, Path, str, int, str]] = []
@@ -363,9 +363,12 @@ class EvidenceService:
                 written_attachments.append((storage_key, q_path, detected_mime, f_size, sha256_hash))
 
             # 5. Phase 2: Short DB transaction with row-level lock on the report
-            # Acquire exclusive lock on parent report to serialize concurrent quota checks
-            lock_stmt = sa.select(Report.id).where(Report.id == report.id).with_for_update()
-            await db.execute(lock_stmt)
+            # Acquire exclusive lock on parent report to serialize concurrent quota and status checks
+            lock_stmt = sa.select(Report).where(Report.id == report.id).with_for_update()
+            res_lock = await db.execute(lock_stmt)
+            locked_report = res_lock.scalar_one_or_none()
+            if not locked_report or locked_report.status in (ReportStatus.RESOLVED, ReportStatus.DISMISSED, ReportStatus.WITHDRAWN) or locked_report.is_shredded:
+                raise EvidenceError("Cannot attach evidence to a closed, dismissed, or withdrawn report.")
 
             # Query existing active attachments count and cumulative byte sum
             quota_stmt = sa.select(

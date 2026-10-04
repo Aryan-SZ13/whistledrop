@@ -6,7 +6,6 @@ from pydantic import BaseModel, ConfigDict, Field
 class ReportVerificationReceiptResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
-    report_id: str
     status: str
     terminal_at: Optional[datetime] = None
     is_shredded: bool = False

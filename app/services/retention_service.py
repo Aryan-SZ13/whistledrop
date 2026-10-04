@@ -1,3 +1,4 @@
+import inspect
 import logging
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -210,7 +211,9 @@ class RetentionService:
           - Releases Redis lock via Lua compare-and-delete.
         """
         batch_limit = limit or settings.RETENTION_BATCH_SIZE
-        redis = await get_redis()
+        redis = get_redis()
+        if inspect.isawaitable(redis):
+            redis = await redis
         owner_token = secrets.token_urlsafe(32)
 
         # Acquire distributed lock

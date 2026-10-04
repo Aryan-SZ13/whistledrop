@@ -6,6 +6,7 @@ from pathlib import Path
 import uuid
 import zipfile
 
+from unittest.mock import AsyncMock, patch
 import pytest
 import pytest_asyncio
 import sqlalchemy as sa
@@ -906,3 +907,266 @@ async def test_audit_export_no_store_headers(
         headers=moderator_headers,
     )
     assert res_exp.headers["Cache-Control"] == "no-store, no-cache, must-revalidate, max-age=0"
+
+
+@pytest.mark.asyncio
+async def test_evidence_upload_blocked_after_withdrawal(client: TestClient):
+    """Verify evidence uploads are strictly rejected on withdrawn reports."""
+    res_rep = client.post(
+        "/api/v1/reports",
+        json={"category": "OTHER", "description": "Testing evidence upload after withdrawal"},
+    )
+    case_code = res_rep.json()["case_code"]
+
+    # Withdraw report
+    res_with = client.post(
+        "/api/v1/reports/withdraw",
+        headers={"X-Case-Code": case_code},
+        json={"confirm": True, "reason": "Test withdrawal"},
+    )
+    assert res_with.status_code == 200
+
+    # Attempt to upload evidence to withdrawn report
+    content = b"Attempted evidence upload after case withdrawal"
+    files = [("files", ("evidence.txt", io.BytesIO(content), "text/plain"))]
+    res_up = client.post(
+        "/api/v1/reports/evidence",
+        headers={"X-Case-Code": case_code},
+        files=files,
+    )
+    assert res_up.status_code in (400, 409, 422)
+    assert "withdrawn" in res_up.text.lower() or "closed" in res_up.text.lower()
+
+
+@pytest.mark.asyncio
+async def test_case_export_detects_unexpected_extra_files_in_archive(
+    client: TestClient, db_session, sample_moderator, moderator_headers
+):
+    """Verify archive verifier detects unexpected injected files not declared in manifest.json."""
+    res = client.post(
+        "/api/v1/reports",
+        json={"category": "SECURITY", "description": "Archive injection attack test"},
+    )
+    case_code = res.json()["case_code"]
+    stmt_id = sa.select(Report.id).where(
+        Report.case_code_digest == derive_case_code_digest(case_code)
+    )
+    report_id = str((await db_session.execute(stmt_id)).scalar_one())
+
+    # Export archive
+    res_exp = client.get(
+        f"/api/v1/moderator/reports/{report_id}/export",
+        headers=moderator_headers,
+    )
+    assert res_exp.status_code == 200
+
+    # Tamper with archive: inject extra file into ZIP
+    tampered_buf = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(res_exp.content), "r") as zin:
+        with zipfile.ZipFile(tampered_buf, "w") as zout:
+            for item in zin.infolist():
+                zout.writestr(item, zin.read(item.filename))
+            zout.writestr("malicious_script.sh", b"#!/bin/bash\necho evil\n")
+
+    tampered_zip = Path(settings.EXPORT_TEMP_DIR) / f"tampered_extra_{uuid.uuid4().hex}.zip"
+    tampered_zip.write_bytes(tampered_buf.getvalue())
+    try:
+        is_valid, errors = case_export_service.verify_case_export_archive(tampered_zip)
+        assert is_valid is False
+        assert any("Unexpected unverified files found in archive" in err for err in errors)
+    finally:
+        if tampered_zip.is_file():
+            tampered_zip.unlink()
+
+
+@pytest.mark.asyncio
+async def test_case_export_rejects_unknown_signing_key_id(
+    client: TestClient, db_session, sample_moderator, moderator_headers
+):
+    """Verify archive verifier rejects manifest with unknown or modified signing_key_id."""
+    res = client.post(
+        "/api/v1/reports",
+        json={"category": "SECURITY", "description": "Unknown signing key id test"},
+    )
+    case_code = res.json()["case_code"]
+    stmt_id = sa.select(Report.id).where(
+        Report.case_code_digest == derive_case_code_digest(case_code)
+    )
+    report_id = str((await db_session.execute(stmt_id)).scalar_one())
+
+    # Export archive
+    res_exp = client.get(
+        f"/api/v1/moderator/reports/{report_id}/export",
+        headers=moderator_headers,
+    )
+    assert res_exp.status_code == 200
+
+    # Tamper manifest.json with unsupported signing_key_id and re-sign
+    tampered_buf = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(res_exp.content), "r") as zin:
+        manifest_data = json.loads(zin.read("manifest.json").decode("utf-8"))
+        manifest_data["signing_key_id"] = "unknown-rogue-key-v999"
+
+        # Re-sign with private key
+        canonical = json.dumps(manifest_data, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        priv_key = case_export_service._get_signing_key()
+        new_sig = priv_key.sign(canonical)
+
+        with zipfile.ZipFile(tampered_buf, "w") as zout:
+            for item in zin.infolist():
+                if item.filename == "manifest.json":
+                    zout.writestr("manifest.json", canonical)
+                elif item.filename == "manifest.sig":
+                    zout.writestr("manifest.sig", new_sig)
+                else:
+                    zout.writestr(item, zin.read(item.filename))
+
+    tampered_zip = Path(settings.EXPORT_TEMP_DIR) / f"tampered_keyid_{uuid.uuid4().hex}.zip"
+    tampered_zip.write_bytes(tampered_buf.getvalue())
+    try:
+        is_valid, errors = case_export_service.verify_case_export_archive(tampered_zip)
+        assert is_valid is False
+        assert any("Unknown or unsupported signing_key_id" in err for err in errors)
+    finally:
+        if tampered_zip.is_file():
+            tampered_zip.unlink()
+
+
+@pytest.mark.asyncio
+async def test_audit_chain_verification_detects_all_mutations(db_session, sample_moderator):
+    """Verify audit chain verification catches action, timestamp, actor, and hash mutations."""
+    rep = Report(
+        case_code_digest=derive_case_code_digest(f"wdc_{uuid.uuid4().hex}"),
+        category=ReportCategory.TECHNICAL,
+        description="Comprehensive audit mutation test case",
+    )
+    db_session.add(rep)
+    await db_session.commit()
+    await db_session.refresh(rep)
+
+    e1 = await audit_service.append_entry(
+        db=db_session,
+        report_id=rep.id,
+        action="REPORT_CREATED",
+        actor_type="REPORTER",
+        metadata={"initial": 1},
+    )
+    e2 = await audit_service.append_entry(
+        db=db_session,
+        report_id=rep.id,
+        action="REPORT_ASSIGNED",
+        actor_type="MODERATOR",
+        actor_id=sample_moderator.id,
+        metadata={"assigned_to": str(sample_moderator.id)},
+    )
+    e3 = await audit_service.append_entry(
+        db=db_session,
+        report_id=rep.id,
+        action="REPORT_STATUS_CHANGED",
+        actor_type="MODERATOR",
+        actor_id=sample_moderator.id,
+        metadata={"to_status": "UNDER_REVIEW"},
+    )
+    await db_session.commit()
+
+    # Baseline valid
+    res_base = await audit_service.verify_chain(db_session, rep.id)
+    assert res_base["is_valid"] is True
+
+    # 1. Action mutation
+    await db_session.execute(
+        sa.update(AuditLog).where(AuditLog.id == e2.id).values(action="MALICIOUS_ACTION")
+    )
+    await db_session.commit()
+    res = await audit_service.verify_chain(db_session, rep.id)
+    assert res["is_valid"] is False
+    assert res["tamper_detected"] is True
+
+    # Revert action
+    await db_session.execute(
+        sa.update(AuditLog).where(AuditLog.id == e2.id).values(action="REPORT_ASSIGNED")
+    )
+    await db_session.commit()
+
+    # 2. Created_at timestamp mutation
+    await db_session.execute(
+        sa.update(AuditLog)
+        .where(AuditLog.id == e2.id)
+        .values(created_at=datetime(2020, 1, 1, tzinfo=timezone.utc))
+    )
+    await db_session.commit()
+    res = await audit_service.verify_chain(db_session, rep.id)
+    assert res["is_valid"] is False
+    assert res["tamper_detected"] is True
+
+    # Revert timestamp
+    await db_session.execute(
+        sa.update(AuditLog).where(AuditLog.id == e2.id).values(created_at=e2.created_at)
+    )
+    await db_session.commit()
+
+    # 3. Actor mutation (moderator_id)
+    await db_session.execute(
+        sa.update(AuditLog).where(AuditLog.id == e2.id).values(moderator_id=None)
+    )
+    await db_session.commit()
+    res = await audit_service.verify_chain(db_session, rep.id)
+    assert res["is_valid"] is False
+    assert res["tamper_detected"] is True
+
+    # Revert actor
+    await db_session.execute(
+        sa.update(AuditLog).where(AuditLog.id == e2.id).values(moderator_id=sample_moderator.id)
+    )
+    await db_session.commit()
+
+    # 4. Previous hash mutation
+    await db_session.execute(
+        sa.update(AuditLog).where(AuditLog.id == e2.id).values(previous_hash="f" * 64)
+    )
+    await db_session.commit()
+    res = await audit_service.verify_chain(db_session, rep.id)
+    assert res["is_valid"] is False
+    assert res["tamper_detected"] is True
+
+
+@pytest.mark.asyncio
+async def test_retention_execute_fails_503_on_redis_outage(
+    client: TestClient, sample_moderator, moderator_headers
+):
+    """Verify retention execution returns HTTP 503 when Redis distributed lock is unavailable."""
+    with patch("app.services.retention_service.get_redis") as mock_get_redis:
+        mock_r = AsyncMock()
+        mock_r.set.side_effect = ConnectionError("Redis server connection refused on 6379")
+        mock_get_redis.return_value = mock_r
+
+        res = client.post(
+            "/api/v1/moderator/retention/execute",
+            headers=moderator_headers,
+            json={"limit": 10},
+        )
+        assert res.status_code == 503
+        assert "Retention lock service unavailable" in res.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_verification_receipt_privacy_omits_internal_uuid(client: TestClient):
+    """Verify anonymous verification receipt never exposes internal report UUID."""
+    res_rep = client.post(
+        "/api/v1/reports",
+        json={
+            "category": "SECURITY",
+            "description": "Valid 50+ character privacy test description for anonymous receipt verification",
+        },
+    )
+    assert res_rep.status_code == 201
+    case_code = res_rep.json()["case_code"]
+
+    res_rec = client.get(
+        "/api/v1/reports/verification",
+        headers={"X-Case-Code": case_code},
+    )
+    assert res_rec.status_code == 200
+    data = res_rec.json()
+    assert "report_id" not in data
+    assert "id" not in data

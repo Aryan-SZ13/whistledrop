@@ -689,7 +689,16 @@ async def execute_retention_sweep(
     payload: RetentionExecuteRequest,
     current_moderator: Moderator = Depends(require_moderator),
 ) -> RetentionExecuteResponse:
-    return await retention_service.execute_retention_sweep(
-        db_factory=async_session_maker,
-        limit=payload.limit,
-    )
+    try:
+        return await retention_service.execute_retention_sweep(
+            db_factory=async_session_maker,
+            limit=payload.limit,
+        )
+    except Exception as e:
+        if "redis" in type(e).__module__.lower() or isinstance(e, (ConnectionError, OSError)):
+            logger.error("Retention execution failed due to lock service failure: %s", type(e).__name__)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Retention lock service unavailable.",
+            )
+        raise
