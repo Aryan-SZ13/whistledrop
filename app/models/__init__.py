@@ -3,6 +3,7 @@
 from app.models.base import Base
 from app.models.enums import (
     EvidenceScanStatus,
+    EvidenceShredStatus,
     MessageSenderType,
     ModeratorRole,
     ReportCategory,
@@ -19,6 +20,7 @@ from app.models.case_message import CaseMessage, CaseMessageModeratorReadState
 __all__ = [
     "Base",
     "EvidenceScanStatus",
+    "EvidenceShredStatus",
     "MessageSenderType",
     "ModeratorRole",
     "ReportCategory",

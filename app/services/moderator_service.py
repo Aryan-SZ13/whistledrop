@@ -1,5 +1,5 @@
 import base64
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 from typing import Any, Dict, List, Optional, Tuple
@@ -8,8 +8,10 @@ import uuid
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.metrics import moderator_actions_total
 from app.models.audit_log import AuditLog
+from app.services.audit_service import audit_service
 from app.models.enums import (
     EvidenceScanStatus,
     ModeratorRole,
@@ -86,6 +88,7 @@ VALID_TRANSITIONS = {
     ReportStatus.UNDER_REVIEW: {ReportStatus.RESOLVED, ReportStatus.DISMISSED},
     ReportStatus.RESOLVED: set(),
     ReportStatus.DISMISSED: set(),
+    ReportStatus.WITHDRAWN: set(),
 }
 
 
@@ -352,6 +355,11 @@ class ModeratorService:
                 raise VersionConflictError(expected_version, report.version_id)
 
             from_status = report.status
+            if from_status == ReportStatus.WITHDRAWN:
+                raise InvalidStateTransitionError(
+                    from_status, new_status, "Withdrawn reports are permanently terminal and cannot be modified."
+                )
+
             now = datetime.now(timezone.utc)
             is_reopening = from_status in (ReportStatus.RESOLVED, ReportStatus.DISMISSED)
 
@@ -385,13 +393,24 @@ class ModeratorService:
             report.status_version += 1
             report.updated_at = now
 
-            audit = AuditLog(
+            # Update retention clock according to terminal status
+            if new_status == ReportStatus.RESOLVED:
+                report.terminal_at = now + timedelta(days=settings.RETENTION_RESOLVED_DAYS)
+            elif new_status == ReportStatus.DISMISSED:
+                report.terminal_at = now + timedelta(days=settings.RETENTION_DISMISSED_DAYS)
+            elif is_reopening:
+                report.terminal_at = None
+
+            # Append tamper-evident chained audit entry
+            await audit_service.append_entry(
+                db=db,
                 report_id=report.id,
-                moderator_id=moderator.id,
                 action=action,
-                metadata_=audit_meta,
+                actor_type="MODERATOR",
+                actor_id=moderator.id,
+                metadata=audit_meta,
+                created_at=now,
             )
-            db.add(audit)
 
             await db.commit()
             await db.refresh(report)
@@ -442,9 +461,9 @@ class ModeratorService:
             if report.version_id != expected_version:
                 raise VersionConflictError(expected_version, report.version_id)
 
-            if report.status in (ReportStatus.RESOLVED, ReportStatus.DISMISSED):
+            if report.status in (ReportStatus.RESOLVED, ReportStatus.DISMISSED, ReportStatus.WITHDRAWN):
                 raise InvalidStateTransitionError(
-                    report.status, report.status, "Cannot modify priority on closed reports."
+                    report.status, report.status, "Cannot modify priority on closed or withdrawn reports."
                 )
 
             from_priority = report.priority
@@ -454,16 +473,18 @@ class ModeratorService:
             report.version_id += 1
             report.updated_at = now
 
-            audit = AuditLog(
+            await audit_service.append_entry(
+                db=db,
                 report_id=report.id,
-                moderator_id=moderator.id,
                 action="REPORT_PRIORITY_CHANGED",
-                metadata_={
+                actor_type="MODERATOR",
+                actor_id=moderator.id,
+                metadata={
                     "from_priority": from_priority.value,
                     "to_priority": new_priority.value,
                 },
+                created_at=now,
             )
-            db.add(audit)
 
             await db.commit()
             await db.refresh(report)
@@ -513,6 +534,11 @@ class ModeratorService:
             if report.version_id != expected_version:
                 raise VersionConflictError(expected_version, report.version_id)
 
+            if report.status == ReportStatus.WITHDRAWN:
+                raise InvalidStateTransitionError(
+                    report.status, report.status, "Cannot assign or unassign withdrawn reports."
+                )
+
             # Authorization logic
             is_admin = moderator.role == ModeratorRole.ADMIN
             is_current_assignee = report.assigned_to == moderator.id
@@ -560,13 +586,15 @@ class ModeratorService:
                     "to_assigned_to": str(target_moderator_id),
                 }
 
-            audit = AuditLog(
+            await audit_service.append_entry(
+                db=db,
                 report_id=report.id,
-                moderator_id=moderator.id,
                 action=action,
-                metadata_=meta,
+                actor_type="MODERATOR",
+                actor_id=moderator.id,
+                metadata=meta,
+                created_at=now,
             )
-            db.add(audit)
 
             await db.commit()
             await db.refresh(report)
@@ -618,6 +646,11 @@ class ModeratorService:
             if report.version_id != expected_version:
                 raise VersionConflictError(expected_version, report.version_id)
 
+            if report.status == ReportStatus.WITHDRAWN:
+                raise InvalidStateTransitionError(
+                    report.status, report.status, "Cannot post updates to withdrawn reports."
+                )
+
             if update_type == ReportUpdateType.PUBLIC_UPDATE and report.status in (
                 ReportStatus.RESOLVED,
                 ReportStatus.DISMISSED,
@@ -639,16 +672,18 @@ class ModeratorService:
             db.add(update)
             await db.flush()
 
-            audit = AuditLog(
+            await audit_service.append_entry(
+                db=db,
                 report_id=report.id,
-                moderator_id=moderator_id,
                 action="REPORT_UPDATE_CREATED",
-                metadata_={
+                actor_type="MODERATOR",
+                actor_id=moderator_id,
+                metadata={
                     "update_id": str(update.id),
                     "update_type": update_type.value,
                 },
+                created_at=now,
             )
-            db.add(audit)
 
             await db.commit()
             await db.refresh(update)

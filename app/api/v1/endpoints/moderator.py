@@ -7,9 +7,12 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Path, Query, Requ
 from fastapi.responses import FileResponse, JSONResponse
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.background import BackgroundTask
 
 from app.api.deps import require_moderator
-from app.db.session import get_db
+from app.core.client_ip import resolve_client_ip
+from app.core.config import settings
+from app.db.session import async_session_maker, get_db
 from app.models.enums import MessageSenderType, ReportCategory, ReportPriority, ReportStatus
 from app.models.moderator import Moderator
 from app.models.report import Report
@@ -23,6 +26,12 @@ from app.schemas.evidence import (
     EvidenceModeratorListResponse,
     EvidenceModeratorResponse,
 )
+from app.schemas.export_retention import (
+    AuditChainVerifyResponse,
+    RetentionExecuteRequest,
+    RetentionExecuteResponse,
+    RetentionPreviewResponse,
+)
 from app.schemas.moderator import (
     DashboardStatsResponse,
     ModeratorReportDetailResponse,
@@ -35,12 +44,18 @@ from app.schemas.moderator import (
     ReportStatusUpdateRequest,
     TimelineListResponse,
 )
+from app.services.audit_service import audit_service
 from app.services.case_channel_service import (
     CaseClosedError,
     InvalidCursorError as ChannelInvalidCursorError,
     MessageNotFoundError as ChannelMessageNotFoundError,
     case_channel_service,
     read_and_validate_message_payload,
+)
+from app.services.case_export_service import (
+    CaseExportError,
+    CaseShreddedError,
+    case_export_service,
 )
 from app.services.evidence_service import (
     EvidenceNotAvailableError,
@@ -56,6 +71,12 @@ from app.services.moderator_service import (
     VersionConflictError,
     moderator_service,
 )
+from app.services.rate_limiter import (
+    RateLimitPolicy,
+    RateLimitUnavailableError,
+    rate_limiter,
+)
+from app.services.retention_service import retention_service
 
 logger = logging.getLogger(__name__)
 
@@ -425,15 +446,14 @@ async def download_report_evidence(
 ):
     """Stream clean evidence file to authorized moderator with download disposition and nosniff."""
     try:
-        file_path, detected_mime, display_name = await evidence_service.get_clean_evidence_for_download(
+        content_bytes, detected_mime, display_name = await evidence_service.get_clean_evidence_for_download(
             db=db,
             report_id=report_id,
             evidence_id=evidence_id,
         )
-        return FileResponse(
-            path=str(file_path),
+        return Response(
+            content=content_bytes,
             media_type=detected_mime,
-            filename=display_name,
             headers={
                 "Content-Disposition": f'attachment; filename="{display_name}"',
                 "X-Content-Type-Options": "nosniff",
@@ -547,3 +567,129 @@ async def acknowledge_moderator_messages_read(
     except ChannelMessageNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
+
+@router.post(
+    "/reports/{report_id}/audit/verify",
+    response_model=AuditChainVerifyResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Cryptographically verify report audit log chain",
+    description="Validates the sequential HMAC-SHA256 audit log integrity for the given report.",
+)
+async def verify_report_audit_chain(
+    request: Request,
+    report_id: uuid.UUID = Path(..., description="Report UUID"),
+    current_moderator: Moderator = Depends(require_moderator),
+    db: AsyncSession = Depends(get_db),
+) -> AuditChainVerifyResponse:
+    client_ip = resolve_client_ip(request)
+    try:
+        policy = RateLimitPolicy(
+            key_prefix="audit_verify",
+            max_requests=settings.AUDIT_VERIFY_RATE_LIMIT,
+            window_seconds=settings.AUDIT_VERIFY_RATE_WINDOW_SECONDS,
+        )
+        limit_res = await rate_limiter.check_rate_limit(
+            policy=policy,
+            client_ip=client_ip,
+        )
+    except RateLimitUnavailableError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Rate limiting service unavailable",
+        )
+    if not limit_res.allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many requests",
+            headers={"Retry-After": str(limit_res.retry_after)},
+        )
+
+    res = await audit_service.verify_chain(db=db, report_id=report_id)
+    return AuditChainVerifyResponse(**res)
+
+
+@router.get(
+    "/reports/{report_id}/export",
+    status_code=status.HTTP_200_OK,
+    summary="Export Asymmetrically Signed Tamper-Evident Case Archive",
+    description="Creates a point-in-time signed snapshot ZIP of the entire case, including decrypted evidence and audit log.",
+)
+async def export_report_case_archive(
+    request: Request,
+    report_id: uuid.UUID = Path(..., description="Report UUID"),
+    current_moderator: Moderator = Depends(require_moderator),
+    db: AsyncSession = Depends(get_db),
+) -> FileResponse:
+    client_ip = resolve_client_ip(request)
+    try:
+        policy = RateLimitPolicy(
+            key_prefix="export",
+            max_requests=settings.EXPORT_RATE_LIMIT,
+            window_seconds=settings.EXPORT_RATE_WINDOW_SECONDS,
+        )
+        limit_res = await rate_limiter.check_rate_limit(
+            policy=policy,
+            client_ip=client_ip,
+        )
+    except RateLimitUnavailableError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Rate limiting service unavailable",
+        )
+    if not limit_res.allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many requests",
+            headers={"Retry-After": str(limit_res.retry_after)},
+        )
+
+    try:
+        zip_path = await case_export_service.export_case_archive(report_id=report_id, db=db)
+    except CaseShreddedError as e:
+        raise HTTPException(status_code=status.HTTP_410_GONE, detail=str(e))
+    except CaseExportError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+    return FileResponse(
+        path=str(zip_path),
+        media_type="application/zip",
+        filename=zip_path.name,
+        background=BackgroundTask(case_export_service.cleanup_export_file, zip_path),
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
+
+
+@router.get(
+    "/retention/preview",
+    response_model=RetentionPreviewResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Preview Expired Terminal Reports for Retention Shredding",
+    description="Inspect cases that have passed their terminal retention thresholds without executing shredding.",
+)
+async def preview_retention_sweep(
+    limit: int = Query(100, ge=1, le=1000),
+    current_moderator: Moderator = Depends(require_moderator),
+    db: AsyncSession = Depends(get_db),
+) -> RetentionPreviewResponse:
+    return await retention_service.preview_retention_sweep(db=db, limit=limit)
+
+
+@router.post(
+    "/retention/execute",
+    response_model=RetentionExecuteResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Execute Distributed-Locked Retention Shredding Sweep",
+    description="Acquires distributed lock and shreds expired cases, destroying evidence keys and recording audit tombstones.",
+)
+async def execute_retention_sweep(
+    payload: RetentionExecuteRequest,
+    current_moderator: Moderator = Depends(require_moderator),
+) -> RetentionExecuteResponse:
+    return await retention_service.execute_retention_sweep(
+        db_factory=async_session_maker,
+        limit=payload.limit,
+    )

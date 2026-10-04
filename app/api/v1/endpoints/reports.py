@@ -20,11 +20,18 @@ from app.schemas.case_message import (
     NotificationStatusAckResponse,
 )
 from app.schemas.evidence import EvidenceUploadResponse
+from app.schemas.export_retention import (
+    ReportVerificationReceiptResponse,
+    ReportWithdrawRequest,
+    ReportWithdrawResponse,
+)
 from app.schemas.report import (
     ReportCreate,
     ReportCreateResponse,
     ReportTrackingResponse,
 )
+from app.services.case_export_service import case_export_service
+from app.services.retention_service import retention_service
 from app.services.case_channel_service import (
     CaseClosedError,
     InvalidCursorError,
@@ -403,6 +410,98 @@ async def acknowledge_notification_status(
         db=db,
         report_id=report.id,
         status_version=ack_req.status_version,
+    )
+
+
+@router.get(
+    "/reports/verification",
+    response_model=ReportVerificationReceiptResponse,
+    summary="Get Asymmetrically Verifiable Case Verification Receipt",
+    description="Retrieve an Ed25519-signed cryptographic receipt verifying the case's current state and audit sequence.",
+)
+async def get_case_verification_receipt(
+    request: Request,
+    response: Response,
+    x_case_code: Optional[str] = Header(None, alias="X-Case-Code"),
+    db: AsyncSession = Depends(get_db),
+) -> ReportVerificationReceiptResponse:
+    add_no_store_cache_headers(response)
+    report = await get_authenticated_report_by_header(x_case_code=x_case_code, db=db)
+    client_ip = resolve_client_ip(request)
+    try:
+        policy = RateLimitPolicy(
+            key_prefix="verification",
+            max_requests=settings.VERIFICATION_RECEIPT_RATE_LIMIT,
+            window_seconds=settings.VERIFICATION_RECEIPT_RATE_WINDOW_SECONDS,
+        )
+        limit_result = await rate_limiter.check_rate_limit(
+            policy=policy,
+            client_ip=client_ip,
+        )
+    except RateLimitUnavailableError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Rate limiting service unavailable",
+        )
+
+    if not limit_result.allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many requests",
+            headers={"Retry-After": str(limit_result.retry_after)},
+        )
+
+    return await case_export_service.generate_verification_receipt(report=report, db=db)
+
+
+@router.post(
+    "/reports/withdraw",
+    response_model=ReportWithdrawResponse,
+    summary="Withdraw Whistleblower Case and Cryptographically Destroy Evidence",
+    description="Idempotently withdraw case, destroy all evidence encryption keys, and enter retention lifecycle.",
+)
+async def withdraw_case(
+    payload: ReportWithdrawRequest,
+    request: Request,
+    response: Response,
+    x_case_code: Optional[str] = Header(None, alias="X-Case-Code"),
+    db: AsyncSession = Depends(get_db),
+) -> ReportWithdrawResponse:
+    add_no_store_cache_headers(response)
+    if not payload.confirm:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Withdrawal must be explicitly confirmed with confirm=true.",
+        )
+    report = await get_authenticated_report_by_header(x_case_code=x_case_code, db=db)
+    client_ip = resolve_client_ip(request)
+    try:
+        policy = RateLimitPolicy(
+            key_prefix="withdraw",
+            max_requests=settings.WITHDRAWAL_RATE_LIMIT,
+            window_seconds=settings.WITHDRAWAL_RATE_WINDOW_SECONDS,
+        )
+        limit_result = await rate_limiter.check_rate_limit(
+            policy=policy,
+            client_ip=client_ip,
+        )
+    except RateLimitUnavailableError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Rate limiting service unavailable",
+        )
+
+    if not limit_result.allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many requests",
+            headers={"Retry-After": str(limit_result.retry_after)},
+        )
+
+    return await retention_service.withdraw_report(
+        report_id=report.id,
+        reason=payload.reason,
+        db=db,
     )
 
 

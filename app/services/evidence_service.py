@@ -16,11 +16,12 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
 from app.core.config import settings
 from app.core.metrics import evidence_scans_total, reconciliation_runs_total
 from app.db.session import async_engine
-from app.models.audit_log import AuditLog
-from app.models.enums import EvidenceScanStatus, ReportStatus
+from app.models.enums import EvidenceScanStatus, EvidenceShredStatus, ReportStatus
 from app.models.evidence import EvidenceAttachment
 from app.models.report import Report
+from app.services.audit_service import audit_service
 from app.services.clamav_service import clamav_service
+from app.services.shredder_service import shredder_service
 
 logger = logging.getLogger(__name__)
 
@@ -413,17 +414,18 @@ class EvidenceService:
                 db.add(attachment)
                 created_records.append(attachment)
 
-            # Create AuditLog entry (omits filenames, hashes, case codes, and PII)
-            audit_log = AuditLog(
+            # Create AuditLog entry via audit_service (tamper-evident hash chain)
+            await audit_service.append_entry(
+                db=db,
                 report_id=report.id,
-                moderator_id=None,
                 action="EVIDENCE_UPLOADED",
-                metadata_={
+                actor_type="REPORTER",
+                actor_id=None,
+                metadata={
                     "attachments_count": len(written_attachments),
                     "total_bytes": cumulative_bytes,
                 },
             )
-            db.add(audit_log)
 
             await db.commit()
             for record in created_records:
@@ -484,28 +486,12 @@ class EvidenceService:
                 await db.execute(stmt)
                 await db.commit()
 
-                # Step 3: Atomic filesystem rename on same filesystem
-                os.replace(str(quarantine_path), str(approved_path))
+                # Step 3: Verify physical quarantine file exists; verify SHA-256 and size before encryption
+                if not quarantine_path.is_file():
+                    raise OSError("Quarantine file missing before promotion")
 
-                # Step 4: Directory fsync provides filesystem metadata durability according to POSIX directory sync contract
-                try:
-                    dir_fd = os.open(str(self.approved_dir), os.O_RDONLY)
-                    try:
-                        os.fsync(dir_fd)
-                    finally:
-                        os.close(dir_fd)
-                except Exception as e:
-                    logger.debug("Approved directory fsync notice: %s", str(e))
-
-                # Step 5: Verify physical approved file exists; verify SHA-256 for content integrity verification
-                if not approved_path.is_file():
-                    raise OSError("Approved file missing after os.replace")
-
-                # SHA-256 calculation provides end-to-end content integrity verification (distinct from filesystem durability)
-                hasher = hashlib.sha256()
-                with open(approved_path, "rb") as f:
-                    while chunk := f.read(65536):
-                        hasher.update(chunk)
+                raw_bytes = quarantine_path.read_bytes()
+                hasher = hashlib.sha256(raw_bytes)
 
                 # Fetch expected hash from DB
                 att_res = await db.execute(
@@ -515,13 +501,9 @@ class EvidenceService:
                 )
                 expected_hash, expected_size = att_res.one()
 
-                if approved_path.stat().st_size != expected_size or hasher.hexdigest() != expected_hash:
+                if len(raw_bytes) != expected_size or hasher.hexdigest() != expected_hash:
                     logger.critical("Data integrity mismatch during promotion for attachment %s", attachment_id)
-                    if approved_path.is_file():
-                        try:
-                            approved_path.unlink()
-                        except Exception:
-                            pass
+                    shredder_service.best_effort_shred_file(quarantine_path)
                     stmt = (
                         sa.update(EvidenceAttachment)
                         .where(EvidenceAttachment.id == attachment_id)
@@ -535,15 +517,30 @@ class EvidenceService:
                     evidence_scans_total.labels(result="failed").inc()
                     return
 
-                # Step 6: Commit DB -> CLEAN and bump Report version_id
-                stmt = (
-                    sa.update(EvidenceAttachment)
-                    .where(EvidenceAttachment.id == attachment_id)
-                    .values(
-                        scan_status=EvidenceScanStatus.SCAN_CLEAN,
-                        updated_at=datetime.now(timezone.utc),
-                    )
-                )
+                # Step 4: AES-256-GCM envelope encryption and write ciphertext to approved/
+                enc = shredder_service.encrypt_evidence_content(raw_bytes)
+                with open(approved_path, "wb") as f_out:
+                    f_out.write(enc.ciphertext)
+                    f_out.flush()
+                    try:
+                        os.fdatasync(f_out.fileno())
+                    except Exception:
+                        pass
+
+                # Step 5: Best-effort shred and unlink plaintext quarantine file
+                shredder_service.best_effort_shred_file(quarantine_path)
+
+                # Step 6: Directory fsync provides filesystem metadata durability
+                try:
+                    dir_fd = os.open(str(self.approved_dir), os.O_RDONLY)
+                    try:
+                        os.fsync(dir_fd)
+                    finally:
+                        os.close(dir_fd)
+                except Exception as e:
+                    logger.debug("Approved directory fsync notice: %s", str(e))
+
+                # Step 7: Commit DB -> CLEAN with envelope encryption columns and bump Report version_id
                 # Fetch parent report_id
                 rep_res = await db.execute(
                     sa.select(EvidenceAttachment.report_id).where(EvidenceAttachment.id == attachment_id)
@@ -564,13 +561,21 @@ class EvidenceService:
                     .where(EvidenceAttachment.id == attachment_id)
                     .values(
                         scan_status=EvidenceScanStatus.CLEAN,
+                        wrapped_dek=enc.wrapped_dek,
+                        dek_nonce=enc.dek_nonce,
+                        dek_tag=enc.dek_tag,
+                        file_nonce=enc.file_nonce,
+                        file_tag=enc.file_tag,
+                        kek_key_id=enc.kek_key_id,
+                        encryption_version=enc.encryption_version,
+                        shred_status=EvidenceShredStatus.ACTIVE.value,
                         updated_at=datetime.now(timezone.utc),
                     )
                 )
                 await db.execute(stmt_clean)
                 await db.commit()
                 evidence_scans_total.labels(result="clean").inc()
-                logger.info("Evidence attachment %s promoted to approved (CLEAN).", attachment_id)
+                logger.info("Evidence attachment %s promoted to approved (CLEAN) with envelope encryption.", attachment_id)
 
             except Exception as e:
                 logger.error("Failed during atomic promotion for attachment %s: %s", attachment_id, str(e))
@@ -653,11 +658,11 @@ class EvidenceService:
         db: AsyncSession,
         report_id: uuid.UUID,
         evidence_id: uuid.UUID,
-    ) -> Tuple[Path, str, str]:
-        """Verify and return physical file path, MIME type, and synthetic download filename.
+    ) -> Tuple[bytes, str, str]:
+        """Verify, decrypt, and return physical file bytes, MIME type, and synthetic download filename.
 
         Returns:
-            Tuple[file_path, detected_mime, synthetic_filename]
+            Tuple[plaintext_bytes, detected_mime, synthetic_filename]
         """
         stmt = sa.select(EvidenceAttachment).where(
             EvidenceAttachment.id == evidence_id,
@@ -672,6 +677,13 @@ class EvidenceService:
         if attachment.scan_status != EvidenceScanStatus.CLEAN:
             raise EvidenceNotAvailableError("Evidence attachment not available.")
 
+        if attachment.shred_status in (
+            EvidenceShredStatus.KEY_DESTROYED.value,
+            EvidenceShredStatus.SHREDDED.value,
+            EvidenceShredStatus.SHRED_FAILED.value,
+        ) or (attachment.wrapped_dek is None and attachment.shred_status != EvidenceShredStatus.ACTIVE.value):
+            raise EvidenceNotAvailableError("Evidence attachment has been cryptographically erased or shredded.")
+
         approved_file = self.approved_dir / f"{attachment.storage_key}.bin"
         if not approved_file.is_file():
             logger.critical("Data loss: Approved evidence file missing on disk for attachment %s", attachment.id)
@@ -685,7 +697,27 @@ class EvidenceService:
                 display_name = d_name
                 break
 
-        return approved_file, attachment.detected_mime, display_name
+        # Read and decrypt if envelope-encrypted
+        raw_ciphertext = approved_file.read_bytes()
+        if attachment.wrapped_dek is not None:
+            plaintext = shredder_service.decrypt_evidence_content(
+                ciphertext=raw_ciphertext,
+                wrapped_dek=attachment.wrapped_dek,
+                dek_nonce=attachment.dek_nonce,
+                dek_tag=attachment.dek_tag,
+                file_nonce=attachment.file_nonce,
+                file_tag=attachment.file_tag,
+                kek_key_id=attachment.kek_key_id,
+            )
+        else:
+            plaintext = raw_ciphertext
+
+        # Verify plaintext hash
+        if hashlib.sha256(plaintext).hexdigest() != attachment.sha256_hash:
+            logger.critical("Evidence content integrity mismatch for attachment %s", attachment.id)
+            raise EvidenceNotAvailableError("Evidence content integrity check failed.")
+
+        return plaintext, attachment.detected_mime, display_name
 
     def _mime_to_extension(self, mime: str) -> str:
         """Map verified MIME type to standard synthetic file extension."""
@@ -736,20 +768,31 @@ class EvidenceService:
 
                 # 3. Hash-Verified Recovery of Interrupted Recovery States (SCAN_CLEAN & PROMOTING > 15m)
                 cutoff_promoting = datetime.now(timezone.utc) - timedelta(minutes=15)
-                stmt_stale_promoting = sa.select(EvidenceAttachment).where(
+                stmt_stale_promoting = sa.select(
+                    EvidenceAttachment.id,
+                    EvidenceAttachment.storage_key,
+                    EvidenceAttachment.file_size,
+                    EvidenceAttachment.sha256_hash,
+                    EvidenceAttachment.wrapped_dek,
+                    EvidenceAttachment.dek_nonce,
+                    EvidenceAttachment.dek_tag,
+                    EvidenceAttachment.file_nonce,
+                    EvidenceAttachment.file_tag,
+                    EvidenceAttachment.kek_key_id,
+                ).where(
                     EvidenceAttachment.scan_status.in_(
                         [EvidenceScanStatus.SCAN_CLEAN, EvidenceScanStatus.PROMOTING]
                     ),
                     EvidenceAttachment.updated_at < cutoff_promoting,
                 )
                 res_promoting = await conn.execute(stmt_stale_promoting)
-                stale_recovering = res_promoting.all()
+                stale_recovering = res_promoting.mappings().all()
 
                 for row in stale_recovering:
-                    att_id = row.id
-                    storage_key = row.storage_key
-                    expected_size = row.file_size
-                    expected_hash = row.sha256_hash
+                    att_id = row["id"]
+                    storage_key = row["storage_key"]
+                    expected_size = row["file_size"]
+                    expected_hash = row["sha256_hash"]
 
                     app_file = self.approved_dir / f"{storage_key}.bin"
                     quar_file = self.quarantine_dir / f"{storage_key}.bin"
@@ -757,12 +800,31 @@ class EvidenceService:
                     recovered = False
 
                     # Check approved path first (Case B, D, E)
-                    if app_file.is_file() and app_file.stat().st_size == expected_size:
-                        hasher = hashlib.sha256()
-                        with open(app_file, "rb") as f:
-                            while chunk := f.read(65536):
-                                hasher.update(chunk)
-                        if hasher.hexdigest() == expected_hash:
+                    if app_file.is_file():
+                        valid_approved = False
+                        try:
+                            if row["wrapped_dek"] is not None:
+                                c_bytes = app_file.read_bytes()
+                                p_bytes = shredder_service.decrypt_evidence_content(
+                                    ciphertext=c_bytes,
+                                    wrapped_dek=row["wrapped_dek"],
+                                    dek_nonce=row["dek_nonce"],
+                                    dek_tag=row["dek_tag"],
+                                    file_nonce=row["file_nonce"],
+                                    file_tag=row["file_tag"],
+                                    kek_key_id=row["kek_key_id"],
+                                )
+                                valid_approved = len(p_bytes) == expected_size and hashlib.sha256(p_bytes).hexdigest() == expected_hash
+                            elif app_file.stat().st_size == expected_size:
+                                hasher = hashlib.sha256()
+                                with open(app_file, "rb") as f:
+                                    while chunk := f.read(65536):
+                                        hasher.update(chunk)
+                                valid_approved = hasher.hexdigest() == expected_hash
+                        except Exception:
+                            valid_approved = False
+
+                        if valid_approved:
                             # Valid approved file verified
                             await conn.execute(
                                 sa.update(EvidenceAttachment)
@@ -796,25 +858,36 @@ class EvidenceService:
                                 hasher.update(chunk)
                         if hasher.hexdigest() == expected_hash:
                             try:
-                                os.replace(str(quar_file), str(app_file))
+                                q_bytes = quar_file.read_bytes()
+                                enc = shredder_service.encrypt_evidence_content(q_bytes)
+                                app_file.write_bytes(enc.ciphertext)
                                 dir_fd = os.open(str(self.approved_dir), os.O_RDONLY)
                                 try:
                                     os.fsync(dir_fd)
                                 finally:
                                     os.close(dir_fd)
+                                shredder_service.best_effort_shred_file(quar_file)
 
                                 await conn.execute(
                                     sa.update(EvidenceAttachment)
                                     .where(EvidenceAttachment.id == att_id)
                                     .values(
                                         scan_status=EvidenceScanStatus.CLEAN,
+                                        wrapped_dek=enc.wrapped_dek,
+                                        dek_nonce=enc.dek_nonce,
+                                        dek_tag=enc.dek_tag,
+                                        file_nonce=enc.file_nonce,
+                                        file_tag=enc.file_tag,
+                                        kek_key_id=enc.kek_key_id,
+                                        encryption_version=enc.encryption_version,
+                                        shred_status=EvidenceShredStatus.ACTIVE.value,
                                         updated_at=datetime.now(timezone.utc),
                                     )
                                 )
                                 await conn.commit()
                                 recovered = True
                             except Exception as e:
-                                logger.error("Recovery rename failed for %s: %s", att_id, str(e))
+                                logger.error("Recovery rename/encryption failed for %s: %s", att_id, str(e))
 
                     if not recovered:
                         # Case F, I, or corrupted content: transition to SCAN_FAILED
@@ -840,20 +913,46 @@ class EvidenceService:
                     EvidenceAttachment.storage_key,
                     EvidenceAttachment.file_size,
                     EvidenceAttachment.sha256_hash,
+                    EvidenceAttachment.wrapped_dek,
+                    EvidenceAttachment.dek_nonce,
+                    EvidenceAttachment.dek_tag,
+                    EvidenceAttachment.file_nonce,
+                    EvidenceAttachment.file_tag,
+                    EvidenceAttachment.kek_key_id,
                 ).where(
-                    EvidenceAttachment.scan_status == EvidenceScanStatus.CLEAN
+                    EvidenceAttachment.scan_status == EvidenceScanStatus.CLEAN,
+                    EvidenceAttachment.shred_status == EvidenceShredStatus.ACTIVE.value,
                 )
                 res_clean = await conn.execute(stmt_clean)
-                for clean_id, s_key, exp_size, exp_hash in res_clean.all():
+                for clean_row in res_clean.mappings().all():
+                    clean_id = clean_row["id"]
+                    s_key = clean_row["storage_key"]
+                    exp_size = clean_row["file_size"]
+                    exp_hash = clean_row["sha256_hash"]
                     clean_file = self.approved_dir / f"{s_key}.bin"
                     valid = False
-                    if clean_file.is_file() and clean_file.stat().st_size == exp_size:
-                        hasher = hashlib.sha256()
-                        with open(clean_file, "rb") as f:
-                            while chunk := f.read(65536):
-                                hasher.update(chunk)
-                        if hasher.hexdigest() == exp_hash:
-                            valid = True
+                    if clean_file.is_file():
+                        try:
+                            if clean_row["wrapped_dek"] is not None:
+                                c_bytes = clean_file.read_bytes()
+                                p_bytes = shredder_service.decrypt_evidence_content(
+                                    ciphertext=c_bytes,
+                                    wrapped_dek=clean_row["wrapped_dek"],
+                                    dek_nonce=clean_row["dek_nonce"],
+                                    dek_tag=clean_row["dek_tag"],
+                                    file_nonce=clean_row["file_nonce"],
+                                    file_tag=clean_row["file_tag"],
+                                    kek_key_id=clean_row["kek_key_id"],
+                                )
+                                valid = len(p_bytes) == exp_size and hashlib.sha256(p_bytes).hexdigest() == exp_hash
+                            elif clean_file.stat().st_size == exp_size:
+                                hasher = hashlib.sha256()
+                                with open(clean_file, "rb") as f:
+                                    while chunk := f.read(65536):
+                                        hasher.update(chunk)
+                                valid = hasher.hexdigest() == exp_hash
+                        except Exception:
+                            valid = False
 
                     if not valid:
                         logger.critical("Approved file missing or corrupted on disk for CLEAN attachment %s", clean_id)

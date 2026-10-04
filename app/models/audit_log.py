@@ -14,6 +14,10 @@ if TYPE_CHECKING:
 class AuditLog(Base):
     __tablename__ = "audit_logs"
 
+    __table_args__ = (
+        sa.UniqueConstraint("report_id", "sequence_number", name="uq_audit_logs_report_seq"),
+    )
+
     id: Mapped[uuid.UUID] = mapped_column(
         sa.Uuid(as_uuid=True),
         primary_key=True,
@@ -24,6 +28,28 @@ class AuditLog(Base):
         sa.ForeignKey("reports.id", ondelete="SET NULL"),
         nullable=True,
         index=True,
+    )
+    sequence_number: Mapped[int] = mapped_column(
+        sa.Integer,
+        nullable=False,
+        default=1,
+        server_default="1",
+    )
+    previous_hash: Mapped[Optional[str]] = mapped_column(
+        sa.String(64),
+        nullable=True,
+    )
+    entry_hash: Mapped[str] = mapped_column(
+        sa.String(64),
+        nullable=False,
+        default="0000000000000000000000000000000000000000000000000000000000000000",
+        server_default="0000000000000000000000000000000000000000000000000000000000000000",
+    )
+    hash_version: Mapped[int] = mapped_column(
+        sa.Integer,
+        nullable=False,
+        default=1,
+        server_default="1",
     )
     moderator_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         sa.Uuid(as_uuid=True),

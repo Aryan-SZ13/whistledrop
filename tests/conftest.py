@@ -28,6 +28,12 @@ TestAsyncSession = async_sessionmaker(
 @pytest_asyncio.fixture(autouse=True)
 async def clean_database():
     """Ensure complete database table isolation before and after every test."""
+    import app.db.session as session_module
+    session_module.async_engine = test_engine
+    session_module.async_session_maker = TestAsyncSession
+    session_module.async_session_factory = TestAsyncSession
+    import app.api.v1.endpoints.health as health_module
+    health_module.async_engine = test_engine
     from app.services.evidence_service import evidence_service
     evidence_service.db_engine = test_engine
     async with test_engine.begin() as conn:

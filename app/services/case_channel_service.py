@@ -16,11 +16,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.db.redis import get_redis
-from app.models.audit_log import AuditLog
 from app.models.case_message import CaseMessage, CaseMessageModeratorReadState
 from app.models.enums import MessageSenderType, ReportStatus
 from app.models.moderator import Moderator
 from app.models.report import Report
+from app.services.audit_service import audit_service
 from app.schemas.case_message import (
     CaseMessageListResponse,
     CaseMessageResponse,
@@ -404,6 +404,8 @@ class CaseChannelService:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Report not found")
 
             # 2. Terminal state enforcement
+            if report.status == ReportStatus.WITHDRAWN:
+                raise CaseClosedError("Case is withdrawn. Messaging is permanently closed.")
             if report.status in (ReportStatus.RESOLVED, ReportStatus.DISMISSED):
                 raise CaseClosedError("Case is closed. Cannot post messages to a resolved or dismissed case.")
 
@@ -455,28 +457,33 @@ class CaseChannelService:
             if sender_type == MessageSenderType.MODERATOR:
                 report.version_id += 1
 
-            # 6. Audit logging (excluding message content or secrets)
+            # 6. Audit logging via audit_service (tamper-evident hash chain)
             if sender_type == MessageSenderType.REPORTER:
-                audit = AuditLog(
+                await audit_service.append_entry(
+                    db=db,
                     report_id=report_id,
-                    moderator_id=None,
                     action="REPORTER_MESSAGE_SUBMITTED",
-                    metadata_={
+                    actor_type="REPORTER",
+                    actor_id=None,
+                    metadata={
                         "public_id": public_id,
                         "message_length": len(content),
                     },
+                    created_at=now,
                 )
             else:
-                audit = AuditLog(
+                await audit_service.append_entry(
+                    db=db,
                     report_id=report_id,
-                    moderator_id=moderator.id if moderator else None,
                     action="MODERATOR_PUBLIC_REPLY_CREATED",
-                    metadata_={
+                    actor_type="MODERATOR",
+                    actor_id=moderator.id if moderator else None,
+                    metadata={
                         "public_id": public_id,
                         "expected_version": report.version_id,
                     },
+                    created_at=now,
                 )
-            db.add(audit)
 
             await db.commit()
             await db.refresh(msg)

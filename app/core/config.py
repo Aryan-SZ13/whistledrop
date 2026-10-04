@@ -6,10 +6,15 @@ DEV_INSECURE_JWT_SECRET = "dev-insecure-jwt-secret-key-change-in-production-min3
 DEV_INSECURE_CASE_CODE_SECRET = "dev-insecure-case-code-secret-key-change-in-production-min32bytes"
 DEV_INSECURE_RATE_LIMIT_KEY_SECRET = "dev-insecure-rate-limit-key-secret-change-in-production-min32"
 DEV_INSECURE_CURSOR_SECRET = "dev-insecure-cursor-secret-key-change-in-production-min32bytes"
+DEV_INSECURE_AUDIT_CHAIN_SECRET = "dev-insecure-audit-chain-secret-key-change-in-production-min32"
+DEV_INSECURE_EVIDENCE_KEK_SECRET = "dev-insecure-evidence-kek-secret-key-change-in-production-min32"
+DEV_INSECURE_EXPORT_SIGNING_KEY_ED25519_PRIVATE = "a1" * 32
 ENV_EXAMPLE_PLACEHOLDER_JWT = "replace-with-a-secure-random-secret-for-jwt-tokens-minimum-32-chars"
 ENV_EXAMPLE_PLACEHOLDER_CASE = "replace-with-a-secure-random-secret-for-case-codes-minimum-32-chars"
 ENV_EXAMPLE_PLACEHOLDER_RATE_LIMIT = "replace-with-a-secure-random-secret-for-rate-limit-keys-min-32"
 ENV_EXAMPLE_PLACEHOLDER_CURSOR = "replace-with-a-secure-random-secret-for-cursor-signing-minimum-32"
+ENV_EXAMPLE_PLACEHOLDER_AUDIT_CHAIN = "replace-with-a-secure-random-secret-for-audit-chain-min-32-chars"
+ENV_EXAMPLE_PLACEHOLDER_EVIDENCE_KEK = "replace-with-a-secure-random-secret-for-evidence-kek-min-32-char"
 
 DEFAULT_DEV_CORS_ORIGINS: List[str] = [
     "http://localhost:3000",
@@ -83,6 +88,31 @@ class Settings(BaseSettings):
     ATTACHMENT_UPLOAD_RATE_LIMIT: int = 10
     ATTACHMENT_UPLOAD_RATE_WINDOW_SECONDS: int = 300
 
+    # Tamper-Evident Audit Chain & Asymmetric Export Signing (Phase 13)
+    AUDIT_CHAIN_SECRET: str = DEV_INSECURE_AUDIT_CHAIN_SECRET
+    EXPORT_SIGNING_KEY_ED25519_PRIVATE: str = DEV_INSECURE_EXPORT_SIGNING_KEY_ED25519_PRIVATE
+    EXPORT_SIGNING_KEY_ID: str = "ed25519:2026-v1"
+    TRUSTED_SIGNING_KEY_FINGERPRINTS: Union[List[str], str] = []
+    EXPORT_TEMP_DIR: str = "./evidence_storage/temp_exports"
+    EXPORT_MAX_ARCHIVE_BYTES: int = 104857600  # 100 MiB
+    EXPORT_RATE_LIMIT: int = 10
+    EXPORT_RATE_WINDOW_SECONDS: int = 60
+    AUDIT_VERIFY_RATE_LIMIT: int = 30
+    AUDIT_VERIFY_RATE_WINDOW_SECONDS: int = 60
+
+    # Evidence Envelope Encryption, Retention & Withdrawal (Phase 14)
+    EVIDENCE_KEK_SECRET: str = DEV_INSECURE_EVIDENCE_KEK_SECRET
+    EVIDENCE_KEK_KEY_ID: str = "kek-2026-v1"
+    RETENTION_RESOLVED_DAYS: int = 30
+    RETENTION_DISMISSED_DAYS: int = 14
+    RETENTION_WITHDRAWN_DAYS: int = 7
+    RETENTION_BATCH_SIZE: int = 50
+    RETENTION_LOCK_TTL_SECONDS: int = 300
+    WITHDRAWAL_RATE_LIMIT: int = 5
+    WITHDRAWAL_RATE_WINDOW_SECONDS: int = 60
+    VERIFICATION_RECEIPT_RATE_LIMIT: int = 30
+    VERIFICATION_RECEIPT_RATE_WINDOW_SECONDS: int = 60
+
     # Configurable CORS Origins
     BACKEND_CORS_ORIGINS: Union[List[str], str] = []
 
@@ -120,6 +150,24 @@ class Settings(BaseSettings):
             return [str(origin).strip() for origin in v if str(origin).strip()]
         return []
 
+    @field_validator("TRUSTED_SIGNING_KEY_FINGERPRINTS", mode="before")
+    @classmethod
+    def assemble_fingerprints(cls, v: Union[str, List[str]]) -> List[str]:
+        if isinstance(v, str):
+            if v.startswith("[") and v.endswith("]"):
+                import json
+
+                try:
+                    parsed = json.loads(v)
+                    if isinstance(parsed, list):
+                        return [str(fp).strip() for fp in parsed if str(fp).strip()]
+                except Exception:
+                    pass
+            return [fp.strip() for fp in v.split(",") if fp.strip()]
+        elif isinstance(v, list):
+            return [str(fp).strip() for fp in v if str(fp).strip()]
+        return []
+
     @field_validator(
         "SUBMISSION_RATE_LIMIT",
         "SUBMISSION_RATE_WINDOW_SECONDS",
@@ -137,6 +185,19 @@ class Settings(BaseSettings):
         "NOTIFICATION_RATE_WINDOW_SECONDS",
         "IDEMPOTENCY_TTL_SECONDS",
         "IDEMPOTENCY_IN_PROGRESS_TTL_SECONDS",
+        "EXPORT_RATE_LIMIT",
+        "EXPORT_RATE_WINDOW_SECONDS",
+        "AUDIT_VERIFY_RATE_LIMIT",
+        "AUDIT_VERIFY_RATE_WINDOW_SECONDS",
+        "WITHDRAWAL_RATE_LIMIT",
+        "WITHDRAWAL_RATE_WINDOW_SECONDS",
+        "VERIFICATION_RECEIPT_RATE_LIMIT",
+        "VERIFICATION_RECEIPT_RATE_WINDOW_SECONDS",
+        "RETENTION_RESOLVED_DAYS",
+        "RETENTION_DISMISSED_DAYS",
+        "RETENTION_WITHDRAWN_DAYS",
+        "RETENTION_BATCH_SIZE",
+        "RETENTION_LOCK_TTL_SECONDS",
     )
     @classmethod
     def validate_rate_limit_bounds(cls, v: int) -> int:
@@ -154,6 +215,7 @@ class Settings(BaseSettings):
         "MIN_FREE_STORAGE_MB",
         "MAX_MESSAGE_LENGTH",
         "MAX_MESSAGE_REQUEST_BODY",
+        "EXPORT_MAX_ARCHIVE_BYTES",
     )
     @classmethod
     def validate_positive_bounds(cls, v: int) -> int:
@@ -175,7 +237,6 @@ class Settings(BaseSettings):
             raise ValueError("CLAMAV_PORT must be between 1 and 65535.")
         return v
 
-
     @model_validator(mode="after")
     def validate_environment_and_secrets(self) -> "Settings":
         env_normalized = self.ENV.strip().lower()
@@ -190,7 +251,7 @@ class Settings(BaseSettings):
             if self.DEBUG is None:
                 self.DEBUG = True
 
-        # 2. Derive domain-separated CURSOR_SECRET if left as dev placeholder in production
+        # 2. Derive domain-separated secrets if left as dev placeholder in production
         if is_production and self.CURSOR_SECRET in (DEV_INSECURE_CURSOR_SECRET, ENV_EXAMPLE_PLACEHOLDER_CURSOR):
             import hmac
             import hashlib
@@ -200,11 +261,37 @@ class Settings(BaseSettings):
                 hashlib.sha256,
             ).hexdigest()
 
+        if is_production and self.AUDIT_CHAIN_SECRET in (DEV_INSECURE_AUDIT_CHAIN_SECRET, ENV_EXAMPLE_PLACEHOLDER_AUDIT_CHAIN):
+            import hmac
+            import hashlib
+            self.AUDIT_CHAIN_SECRET = hmac.new(
+                self.CASE_CODE_SECRET.encode("utf-8"),
+                b"whistledrop-audit-chain-secret-domain-separation",
+                hashlib.sha256,
+            ).hexdigest()
+
+        if is_production and self.EVIDENCE_KEK_SECRET in (DEV_INSECURE_EVIDENCE_KEK_SECRET, ENV_EXAMPLE_PLACEHOLDER_EVIDENCE_KEK):
+            import hmac
+            import hashlib
+            self.EVIDENCE_KEK_SECRET = hmac.new(
+                self.CASE_CODE_SECRET.encode("utf-8"),
+                b"whistledrop-evidence-kek-secret-domain-separation",
+                hashlib.sha256,
+            ).hexdigest()
+
         # 3. Secret Separation & Non-Reuse Verification
-        secrets_set = {self.JWT_SECRET, self.CASE_CODE_SECRET, self.RATE_LIMIT_KEY_SECRET, self.CURSOR_SECRET}
-        if len(secrets_set) < 4:
+        secrets_set = {
+            self.JWT_SECRET,
+            self.CASE_CODE_SECRET,
+            self.RATE_LIMIT_KEY_SECRET,
+            self.CURSOR_SECRET,
+            self.AUDIT_CHAIN_SECRET,
+            self.EVIDENCE_KEK_SECRET,
+        }
+        if len(secrets_set) < 6:
             raise ValueError(
-                "JWT_SECRET, CASE_CODE_SECRET, RATE_LIMIT_KEY_SECRET, and CURSOR_SECRET must be distinct secrets. "
+                "JWT_SECRET, CASE_CODE_SECRET, RATE_LIMIT_KEY_SECRET, CURSOR_SECRET, "
+                "AUDIT_CHAIN_SECRET, and EVIDENCE_KEK_SECRET must be distinct secrets. "
                 "Do NOT reuse the same secret across different security contexts."
             )
 
@@ -215,10 +302,14 @@ class Settings(BaseSettings):
                 DEV_INSECURE_CASE_CODE_SECRET,
                 DEV_INSECURE_RATE_LIMIT_KEY_SECRET,
                 DEV_INSECURE_CURSOR_SECRET,
+                DEV_INSECURE_AUDIT_CHAIN_SECRET,
+                DEV_INSECURE_EVIDENCE_KEK_SECRET,
                 ENV_EXAMPLE_PLACEHOLDER_JWT,
                 ENV_EXAMPLE_PLACEHOLDER_CASE,
                 ENV_EXAMPLE_PLACEHOLDER_RATE_LIMIT,
                 ENV_EXAMPLE_PLACEHOLDER_CURSOR,
+                ENV_EXAMPLE_PLACEHOLDER_AUDIT_CHAIN,
+                ENV_EXAMPLE_PLACEHOLDER_EVIDENCE_KEK,
             }
             if self.JWT_SECRET in insecure_placeholders or len(self.JWT_SECRET) < 32:
                 raise ValueError(
@@ -236,14 +327,36 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "Production requires a strong, unique CURSOR_SECRET of at least 32 characters."
                 )
+            if self.AUDIT_CHAIN_SECRET in insecure_placeholders or len(self.AUDIT_CHAIN_SECRET) < 32:
+                raise ValueError(
+                    "Production requires a strong, unique AUDIT_CHAIN_SECRET of at least 32 characters."
+                )
+            if self.EVIDENCE_KEK_SECRET in insecure_placeholders or len(self.EVIDENCE_KEK_SECRET) < 32:
+                raise ValueError(
+                    "Production requires a strong, unique EVIDENCE_KEK_SECRET of at least 32 characters."
+                )
 
-        # 4. CORS Behavior
+        # 5. Trusted Ed25519 Fingerprints derivation / verification
+        try:
+            import hashlib
+            from cryptography.hazmat.primitives.asymmetric import ed25519
+            seed_bytes = bytes.fromhex(self.EXPORT_SIGNING_KEY_ED25519_PRIVATE)
+            if len(seed_bytes) == 32:
+                priv = ed25519.Ed25519PrivateKey.from_private_bytes(seed_bytes)
+                pub_raw = priv.public_key().public_bytes_raw()
+                fp = f"SHA256:{hashlib.sha256(pub_raw).hexdigest()}"
+                if not self.TRUSTED_SIGNING_KEY_FINGERPRINTS:
+                    self.TRUSTED_SIGNING_KEY_FINGERPRINTS = [fp]
+        except Exception:
+            pass
+
+        # 6. CORS Behavior
         # In development: default to common local frontend addresses if not specified
         # In production: default to empty list (restrictive by default) unless explicitly set
         if not self.BACKEND_CORS_ORIGINS and not is_production:
             self.BACKEND_CORS_ORIGINS = DEFAULT_DEV_CORS_ORIGINS
 
-        # 5. Attachment Bounds Validation
+        # 7. Attachment Bounds Validation
         if self.MAX_ATTACHMENT_SIZE_MB * 1024 * 1024 > self.MAX_TOTAL_ATTACHMENT_BYTES:
             raise ValueError(
                 "MAX_ATTACHMENT_SIZE_MB in bytes cannot exceed MAX_TOTAL_ATTACHMENT_BYTES."

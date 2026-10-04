@@ -12,9 +12,10 @@ asyncpg==0.31.0
 alembic==1.14.0
 greenlet==3.5.6
 
-# Authentication & Cryptography (Argon2 & JWT)
+# Authentication & Cryptography (Argon2, JWT, AES-GCM, Ed25519)
 argon2-cffi==25.1.0
 pyjwt==2.15.1
+cryptography==50.0.2
 
 # Testing & HTTP Client
 httpx==0.28.1

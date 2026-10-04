@@ -4,10 +4,10 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import derive_case_code_digest, generate_case_code
-from app.models.audit_log import AuditLog
 from app.models.enums import ReportStatus, ReportUpdateType
 from app.models.report import Report
 from app.models.report_update import ReportUpdate
+from app.services.audit_service import audit_service
 from app.schemas.report import (
     ReportCreate,
     ReportTrackingResponse,
@@ -57,17 +57,18 @@ class ReportService:
             db.add(report)
             await db.flush()  # Populates report.id for internal audit log linkage
 
-            # 4. Create safe audit log entry (no case codes, digests, descriptions, or PII)
-            audit_log = AuditLog(
+            # 4. Create safe audit log entry via audit_service (tamper-evident hash chain)
+            await audit_service.append_entry(
+                db=db,
                 report_id=report.id,
-                moderator_id=None,
                 action="REPORT_SUBMITTED",
-                metadata_={
+                actor_type="REPORTER",
+                actor_id=None,
+                metadata={
                     "category": report.category.value,
                     "has_evidence": bool(report.evidence_url),
                 },
             )
-            db.add(audit_log)
 
             # 5. Commit both records atomically
             await db.commit()

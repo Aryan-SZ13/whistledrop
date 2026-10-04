@@ -16,6 +16,17 @@ class ReportStatus(str, enum.Enum):
     UNDER_REVIEW = "UNDER_REVIEW"
     RESOLVED = "RESOLVED"
     DISMISSED = "DISMISSED"
+    WITHDRAWN = "WITHDRAWN"
+
+
+class EvidenceShredStatus(str, enum.Enum):
+    """Lifecycle and shredding state machine statuses for evidence attachments."""
+    ACTIVE = "ACTIVE"
+    SHRED_PENDING = "SHRED_PENDING"
+    KEY_DESTROYED = "KEY_DESTROYED"
+    FILE_REMOVAL_PENDING = "FILE_REMOVAL_PENDING"
+    SHREDDED = "SHREDDED"
+    SHRED_FAILED = "SHRED_FAILED"
 
 
 class ReportPriority(str, enum.Enum):

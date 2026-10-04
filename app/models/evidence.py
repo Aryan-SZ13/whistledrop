@@ -59,6 +59,43 @@ class EvidenceAttachment(Base):
         sa.DateTime(timezone=True),
         nullable=True,
     )
+    shred_status: Mapped[str] = mapped_column(
+        sa.String(32),
+        nullable=False,
+        default="ACTIVE",
+        server_default="ACTIVE",
+        index=True,
+    )
+    wrapped_dek: Mapped[Optional[bytes]] = mapped_column(
+        sa.LargeBinary,
+        nullable=True,
+    )
+    dek_nonce: Mapped[Optional[bytes]] = mapped_column(
+        sa.LargeBinary,
+        nullable=True,
+    )
+    dek_tag: Mapped[Optional[bytes]] = mapped_column(
+        sa.LargeBinary,
+        nullable=True,
+    )
+    file_nonce: Mapped[Optional[bytes]] = mapped_column(
+        sa.LargeBinary,
+        nullable=True,
+    )
+    file_tag: Mapped[Optional[bytes]] = mapped_column(
+        sa.LargeBinary,
+        nullable=True,
+    )
+    kek_key_id: Mapped[Optional[str]] = mapped_column(
+        sa.String(64),
+        nullable=True,
+    )
+    encryption_version: Mapped[int] = mapped_column(
+        sa.Integer,
+        nullable=False,
+        default=1,
+        server_default="1",
+    )
     created_at: Mapped[datetime] = mapped_column(
         sa.DateTime(timezone=True),
         server_default=sa.func.now(),
