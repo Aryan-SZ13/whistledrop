@@ -360,24 +360,75 @@ async def test_cache_control_no_store_headers(client, db_session):
     """Verify all anonymous endpoints emit strict Cache-Control: no-store headers."""
     report, case_code = await setup_test_report(db_session)
     headers = {"X-Case-Code": case_code}
+    expected_cc = "no-store, no-cache, must-revalidate, max-age=0"
 
     # 1. GET /reports/messages
     res_msg = client.get("/api/v1/reports/messages", headers=headers)
     assert res_msg.status_code == 200
-    assert "no-store" in res_msg.headers.get("Cache-Control", "")
+    assert res_msg.headers.get("Cache-Control") == expected_cc
     assert res_msg.headers.get("Pragma") == "no-cache"
+    assert res_msg.headers.get("Expires") == "0"
 
-    # 2. GET /reports/notifications
+    # 2. POST /reports/messages
+    res_post_msg = client.post("/api/v1/reports/messages", json={"content": "Cache test message"}, headers=headers)
+    assert res_post_msg.status_code == 201
+    assert res_post_msg.headers.get("Cache-Control") == expected_cc
+    assert res_post_msg.headers.get("Pragma") == "no-cache"
+    assert res_post_msg.headers.get("Expires") == "0"
+
+    # 3. GET /reports/notifications
     res_notif = client.get("/api/v1/reports/notifications", headers=headers)
     assert res_notif.status_code == 200
-    assert "no-store" in res_notif.headers.get("Cache-Control", "")
+    assert res_notif.headers.get("Cache-Control") == expected_cc
     assert res_notif.headers.get("Pragma") == "no-cache"
+    assert res_notif.headers.get("Expires") == "0"
 
-    # 3. GET /reports/{case_code} (legacy tracking)
+    # 4. POST /reports/notifications/read
+    res_ack_notif = client.post("/api/v1/reports/notifications/read", json={"status_version": 1}, headers=headers)
+    assert res_ack_notif.status_code == 200
+    assert res_ack_notif.headers.get("Cache-Control") == expected_cc
+    assert res_ack_notif.headers.get("Pragma") == "no-cache"
+    assert res_ack_notif.headers.get("Expires") == "0"
+
+    # 5. GET /reports/{case_code} (legacy tracking)
     res_track = client.get(f"/api/v1/reports/{case_code}")
     assert res_track.status_code == 200
-    assert "no-store" in res_track.headers.get("Cache-Control", "")
+    assert res_track.headers.get("Cache-Control") == expected_cc
     assert res_track.headers.get("Pragma") == "no-cache"
+    assert res_track.headers.get("Expires") == "0"
+
+
+@pytest.mark.asyncio
+async def test_redis_outage_fails_closed_on_message_creation(client, db_session):
+    """Verify Redis outage returns 503 without leaking details and fails closed."""
+    from unittest.mock import AsyncMock, patch
+    import redis.exceptions as redis_exceptions
+
+    report, case_code = await setup_test_report(db_session)
+    idempotency_key = str(uuid.uuid4())
+    headers = {
+        "X-Case-Code": case_code,
+        "Idempotency-Key": idempotency_key,
+    }
+    payload = {"content": "This message must fail closed during Redis outage."}
+
+    mock_redis = AsyncMock()
+    mock_redis.set.side_effect = redis_exceptions.ConnectionError("Redis connection refused on 127.0.0.1:6379")
+
+    with patch("app.services.case_channel_service.get_redis", return_value=mock_redis):
+        res = client.post("/api/v1/reports/messages", json=payload, headers=headers)
+        assert res.status_code == 503
+        assert res.json() == {"detail": "Idempotency service temporarily unavailable."}
+        # Verify no Redis exception details or connection strings leak
+        assert "redis" not in res.text.lower()
+        assert "connection" not in res.text.lower()
+        assert "refused" not in res.text.lower()
+        assert "6379" not in res.text
+
+    # Verify fail-closed: message was NOT created in DB
+    stmt = sa.select(CaseMessage).where(CaseMessage.report_id == report.id)
+    res_db = await db_session.execute(stmt)
+    assert res_db.scalar_one_or_none() is None
 
 
 # ==============================================================================

@@ -80,7 +80,7 @@ class InvalidCursorError(Exception):
 
 def add_no_store_cache_headers(response: Response) -> None:
     """Apply strict no-store HTTP cache control headers to prevent client and intermediary caching."""
-    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, private"
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     response.headers["Pragma"] = "no-cache"
     response.headers["Expires"] = "0"
 
@@ -230,66 +230,75 @@ class CaseChannelService:
             Tuple[owner_token, cached_response_data]
             If cached_response_data is not None, request is already completed.
         """
-        redis_client = await get_redis()
-        owner_token = secrets.token_hex(16)
-        content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        try:
+            redis_client = await get_redis()
+            owner_token = secrets.token_hex(16)
+            content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
 
-        reservation_payload = json.dumps({
-            "state": "IN_PROGRESS",
-            "owner_token": owner_token,
-            "content_hash": content_hash,
-            "created_at": time.time(),
-        })
+            reservation_payload = json.dumps({
+                "state": "IN_PROGRESS",
+                "owner_token": owner_token,
+                "content_hash": content_hash,
+                "created_at": time.time(),
+            })
 
-        # Atomic SET NX EX
-        acquired = await redis_client.set(
-            redis_key,
-            reservation_payload,
-            ex=settings.IDEMPOTENCY_IN_PROGRESS_TTL_SECONDS,
-            nx=True,
-        )
-
-        if acquired:
-            return owner_token, None
-
-        # Key already exists in Redis
-        raw_val = await redis_client.get(redis_key)
-        if not raw_val:
-            # Race where previous reservation just expired
-            acquired_retry = await redis_client.set(
+            # Atomic SET NX EX
+            acquired = await redis_client.set(
                 redis_key,
                 reservation_payload,
                 ex=settings.IDEMPOTENCY_IN_PROGRESS_TTL_SECONDS,
                 nx=True,
             )
-            if acquired_retry:
+
+            if acquired:
                 return owner_token, None
+
+            # Key already exists in Redis
+            raw_val = await redis_client.get(redis_key)
+            if not raw_val:
+                # Race where previous reservation just expired
+                acquired_retry = await redis_client.set(
+                    redis_key,
+                    reservation_payload,
+                    ex=settings.IDEMPOTENCY_IN_PROGRESS_TTL_SECONDS,
+                    nx=True,
+                )
+                if acquired_retry:
+                    return owner_token, None
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Concurrent request with identical idempotency key in progress.",
+                )
+
+            try:
+                existing = json.loads(raw_val)
+            except Exception:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Invalid existing idempotency record.",
+                )
+
+            if existing.get("content_hash") != content_hash:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Idempotency key reused with different payload.",
+                )
+
+            if existing.get("state") == "COMPLETED":
+                return "", existing.get("response")
+
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Concurrent request with identical idempotency key in progress.",
             )
-
-        try:
-            existing = json.loads(raw_val)
-        except Exception:
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error("Idempotency service failure during reservation: %s", type(e).__name__)
             raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Invalid existing idempotency record.",
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Idempotency service temporarily unavailable.",
             )
-
-        if existing.get("content_hash") != content_hash:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Idempotency key reused with different payload.",
-            )
-
-        if existing.get("state") == "COMPLETED":
-            return "", existing.get("response")
-
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Concurrent request with identical idempotency key in progress.",
-        )
 
     async def finalize_idempotency_completed(
         self,
@@ -299,23 +308,26 @@ class CaseChannelService:
         response_dict: Dict[str, Any],
     ) -> None:
         """Transition idempotency reservation to COMPLETED using Lua CAS."""
-        redis_client = await get_redis()
-        content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
-        completed_payload = json.dumps({
-            "state": "COMPLETED",
-            "content_hash": content_hash,
-            "response": response_dict,
-            "completed_at": time.time(),
-        })
+        try:
+            redis_client = await get_redis()
+            content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            completed_payload = json.dumps({
+                "state": "COMPLETED",
+                "content_hash": content_hash,
+                "response": response_dict,
+                "completed_at": time.time(),
+            })
 
-        await redis_client.eval(
-            LUA_IDEMP_CAS_SCRIPT,
-            1,
-            redis_key,
-            owner_token,
-            completed_payload,
-            settings.IDEMPOTENCY_TTL_SECONDS,
-        )
+            await redis_client.eval(
+                LUA_IDEMP_CAS_SCRIPT,
+                1,
+                redis_key,
+                owner_token,
+                completed_payload,
+                settings.IDEMPOTENCY_TTL_SECONDS,
+            )
+        except Exception as e:
+            logger.warning("Failed to finalize idempotency in Redis: %s", type(e).__name__)
 
     async def release_idempotency_reservation(
         self,
@@ -334,7 +346,7 @@ class CaseChannelService:
                 owner_token,
             )
         except Exception as e:
-            logger.warning("Failed to release idempotency reservation %s: %s", redis_key, str(e))
+            logger.warning("Failed to release idempotency reservation %s: %s", redis_key, type(e).__name__)
 
     # --------------------------------------------------------------------------
     # Message Creation (Reporter & Moderator)
