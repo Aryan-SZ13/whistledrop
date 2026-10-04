@@ -19,6 +19,9 @@ from app.models.case_message import CaseMessage, CaseMessageModeratorReadState
 from app.models.moderator_session import ModeratorSession
 from app.models.webhook import WebhookEndpoint, OutboxEvent, WebhookDelivery
 from app.models.quorum import QuorumRequest
+from app.models.encryption import CaseEncryptionKey
+from app.models.transparency import MerkleTreeState, MerkleLeaf, SignedTreeHead
+from app.models.security_state import WarrantCanary, SystemSecurityState
 
 __all__ = [
     "Base",
@@ -41,4 +44,10 @@ __all__ = [
     "OutboxEvent",
     "WebhookDelivery",
     "QuorumRequest",
+    "CaseEncryptionKey",
+    "MerkleTreeState",
+    "MerkleLeaf",
+    "SignedTreeHead",
+    "WarrantCanary",
+    "SystemSecurityState",
 ]

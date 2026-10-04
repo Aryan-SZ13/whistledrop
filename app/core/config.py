@@ -13,6 +13,9 @@ DEV_INSECURE_MFA_KEK_SECRET = "dev-insecure-mfa-kek-secret-key-change-in-product
 DEV_INSECURE_REFRESH_SECRET = "dev-insecure-refresh-secret-key-change-in-production-min32"
 DEV_INSECURE_WEBHOOK_KEK_SECRET = "dev-insecure-webhook-kek-secret-change-in-production-min32"
 DEV_INSECURE_WEBHOOK_SALT = "dev-insecure-webhook-salt-change-in-production-min32bytes"
+DEV_INSECURE_PAYLOAD_KEK_1 = "dev-insecure-payload-kek-secret-change-in-production-min32byt"
+DEV_INSECURE_TRANSPARENCY_SALT = "dev-insecure-transparency-salt-change-in-production-min32"
+DEV_INSECURE_CANARY_SIGNING_KEY_ED25519_PRIVATE = "b2" * 32
 ENV_EXAMPLE_PLACEHOLDER_JWT = "replace-with-a-secure-random-secret-for-jwt-tokens-minimum-32-chars"
 ENV_EXAMPLE_PLACEHOLDER_CASE = "replace-with-a-secure-random-secret-for-case-codes-minimum-32-chars"
 ENV_EXAMPLE_PLACEHOLDER_RATE_LIMIT = "replace-with-a-secure-random-secret-for-rate-limit-keys-min-32"
@@ -23,6 +26,8 @@ ENV_EXAMPLE_PLACEHOLDER_MFA_KEK = "replace-with-a-secure-random-secret-for-mfa-k
 ENV_EXAMPLE_PLACEHOLDER_REFRESH = "replace-with-a-secure-random-secret-for-refresh-token-min-32-chars"
 ENV_EXAMPLE_PLACEHOLDER_WEBHOOK_KEK = "replace-with-a-secure-random-secret-for-webhook-kek-min-32-chars"
 ENV_EXAMPLE_PLACEHOLDER_WEBHOOK_SALT = "replace-with-a-secure-random-secret-for-webhook-salt-min-32-char"
+ENV_EXAMPLE_PLACEHOLDER_PAYLOAD_KEK = "replace-with-a-secure-random-secret-for-payload-kek-min-32-chars"
+ENV_EXAMPLE_PLACEHOLDER_TRANSPARENCY_SALT = "replace-with-a-secure-random-secret-for-transparency-salt-min-32"
 
 DEFAULT_DEV_CORS_ORIGINS: List[str] = [
     "http://localhost:3000",
@@ -146,6 +151,25 @@ class Settings(BaseSettings):
     QUORUM_ENFORCE_CASE_REOPEN: bool = False
     QUORUM_ENFORCE_MODERATOR_CHANGES: bool = False
     QUORUM_ENFORCE_WEBHOOK_DELETE: bool = False
+
+    # Phase 18: Application-Level Payload Encryption (ALEE) & Keyring
+    PAYLOAD_KEK_ACTIVE_VERSION: int = 1
+    PAYLOAD_KEK_KEYRING: Union[dict[str, str], str] = {
+        "1": DEV_INSECURE_PAYLOAD_KEK_1
+    }
+
+    # Phase 19: Append-Only Merkle Transparency Log
+    TRANSPARENCY_SALT: str = DEV_INSECURE_TRANSPARENCY_SALT
+    TRANSPARENCY_STH_SIGNING_KEY_ID: str = "whistledrop-transparency-2026-v1"
+    TRANSPARENCY_RATE_LIMIT: int = 60
+    TRANSPARENCY_RATE_WINDOW_SECONDS: int = 60
+
+    # Phase 20: Cryptographic Warrant Canary & Emergency Sealing
+    CANARY_SIGNING_KEY_ED25519_PRIVATE: str = DEV_INSECURE_CANARY_SIGNING_KEY_ED25519_PRIVATE
+    CANARY_SIGNING_KEY_ID: str = "whistledrop-canary-2026-v1"
+    CANARY_VALIDITY_DAYS: int = 7
+    DEAD_MAN_INTERVAL_DAYS: int = 14
+    DEAD_MAN_WARNING_HOURS: int = 48
 
     # Configurable CORS Origins
     BACKEND_CORS_ORIGINS: Union[List[str], str] = []
@@ -349,6 +373,28 @@ class Settings(BaseSettings):
                 hashlib.sha256,
             ).hexdigest()
 
+        if is_production and self.TRANSPARENCY_SALT in (DEV_INSECURE_TRANSPARENCY_SALT, ENV_EXAMPLE_PLACEHOLDER_TRANSPARENCY_SALT):
+            import hmac
+            import hashlib
+            self.TRANSPARENCY_SALT = hmac.new(
+                self.CASE_CODE_SECRET.encode("utf-8"),
+                b"whistledrop-transparency-salt-domain-separation",
+                hashlib.sha256,
+            ).hexdigest()
+
+        # Keyring Parsing & Validation
+        if isinstance(self.PAYLOAD_KEK_KEYRING, str):
+            import json
+            try:
+                self.PAYLOAD_KEK_KEYRING = json.loads(self.PAYLOAD_KEK_KEYRING)
+            except Exception:
+                raise ValueError("PAYLOAD_KEK_KEYRING must be a valid JSON mapping of version to secret string.")
+
+        active_ver_str = str(self.PAYLOAD_KEK_ACTIVE_VERSION)
+        if active_ver_str not in self.PAYLOAD_KEK_KEYRING:
+            raise ValueError(f"PAYLOAD_KEK_ACTIVE_VERSION '{active_ver_str}' not found in PAYLOAD_KEK_KEYRING.")
+        active_payload_kek = self.PAYLOAD_KEK_KEYRING[active_ver_str]
+
         # 3. Secret Separation & Non-Reuse Verification
         secrets_set = {
             self.JWT_SECRET,
@@ -361,8 +407,10 @@ class Settings(BaseSettings):
             self.REFRESH_SECRET,
             self.WEBHOOK_KEK_SECRET,
             self.WEBHOOK_SALT,
+            active_payload_kek,
+            self.TRANSPARENCY_SALT,
         }
-        if len(secrets_set) < 10:
+        if len(secrets_set) < 12:
             raise ValueError(
                 "Cryptographic secrets must be distinct secrets. "
                 "Do NOT reuse the same secret across different security contexts."

@@ -37,9 +37,25 @@ class ReportUpdate(Base):
         default=ReportUpdateType.PUBLIC_UPDATE,
         index=True,
     )
-    message: Mapped[str] = mapped_column(
+    message: Mapped[Optional[str]] = mapped_column(
         sa.Text,
-        nullable=False,
+        nullable=True,
+    )
+    message_encrypted: Mapped[Optional[bytes]] = mapped_column(
+        sa.LargeBinary,
+        nullable=True,
+    )
+    message_iv: Mapped[Optional[bytes]] = mapped_column(
+        sa.LargeBinary,
+        nullable=True,
+    )
+    message_tag: Mapped[Optional[bytes]] = mapped_column(
+        sa.LargeBinary,
+        nullable=True,
+    )
+    message_aad_version: Mapped[Optional[int]] = mapped_column(
+        sa.Integer,
+        nullable=True,
     )
     created_at: Mapped[datetime] = mapped_column(
         sa.DateTime(timezone=True),

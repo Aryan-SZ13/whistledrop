@@ -478,6 +478,15 @@ WhistleDrop features an anonymous, end-to-end privacy-preserving two-way communi
 - [x] **Phase 10:** Advanced Moderator Case Management (Mandatory OCC, Priority, Assignment, Cursor-Paginated Timeline, Dashboard Aggregates)
 - [x] **Phase 11:** Anonymous Two-Way Case Communication (High-Entropy Public Message IDs, Keyset Cursor Pagination, OCC/Terminal Row-Locking, Redis CAS Idempotency, 64 KiB Raw Transport Bound)
 - [x] **Phase 12:** Anonymous Case Notifications & Read States (Per-Moderator High-Water Marks, Reporter Case Status Versioning, Deterministic Tuple Ordering, Strict No-Store Cache Policy)
+- [x] **Phase 13:** Asymmetrically Signed Receipt Generation & Case Integrity Verification (Ed25519 Signatures, Deterministic Canonical JSON)
+- [x] **Phase 14:** Cryptographic Audit Hash Chains, Unified Cryptographic Erasure & Retention Lifecycle Policy
+- [x] **Phase 15:** Moderator Multi-Factor Authentication (TOTP MFA), Session Revocation & Dual-Control Quorum Approvals ("Four-Eyes" Principle)
+- [x] **Phase 16:** Transactional Outbox Pattern & SSRF-Protected Webhook Notifications
+- [x] **Phase 17:** Secure Asymmetrically Signed Case Export Bundles (Ed25519 Detached Digital Signatures)
+- [x] **Phase 18:** Application-Level Envelope Encryption (ALEE), Key Rotation & Unified Cryptographic Shredding
+- [x] **Phase 19:** RFC 6962 Append-Only Merkle Tree Transparency Log & Cryptographic Inclusion/Consistency Proofs
+- [x] **Phase 20:** Warrant Canaries, Dead-Man's Switch Automation & Emergency Access Sealing
+- [x] **Stage 24:** Production Frontend & UX (React 19 + TypeScript + Vite, Zero Case-Code Leakage In-Memory Architecture, Full Anonymous & Moderator Portals, Hardened CSP)
 
 ---
 

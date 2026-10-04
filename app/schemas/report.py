@@ -32,6 +32,9 @@ class ReportCreate(BaseModel):
     )
 
 
+from app.schemas.transparency import MerkleReceipt
+
+
 class ReportCreateResponse(BaseModel):
     """Response returned upon successful report submission.
 

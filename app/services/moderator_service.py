@@ -5,6 +5,7 @@ import logging
 from typing import Any, Dict, List, Optional, Tuple
 import uuid
 
+from fastapi import HTTPException
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -31,6 +32,10 @@ from app.schemas.moderator import (
     ModeratorUpdateResponse,
     TimelineEventResponse,
     TimelineListResponse,
+)
+from app.services.payload_encryption_service import (
+    DecryptionContext,
+    payload_encryption_service,
 )
 
 logger = logging.getLogger(__name__)
@@ -125,6 +130,28 @@ def escape_like_string(value: str) -> str:
 class ModeratorService:
     """Service layer for internal moderator report management and inspection."""
 
+    async def _decrypt_report_desc(self, db: AsyncSession, report: Report) -> str:
+        desc = report.description
+        if desc is None and report.description_encrypted is not None:
+            try:
+                desc = await payload_encryption_service.decrypt_payload(
+                    db=db,
+                    report_id=report.id,
+                    object_type="REPORT",
+                    object_id=report.id,
+                    field_name="description",
+                    ciphertext=report.description_encrypted,
+                    iv=report.description_iv,
+                    tag=report.description_tag,
+                    aad_version=report.description_aad_version,
+                    context=DecryptionContext.MODERATOR_CASE_READ,
+                )
+            except HTTPException:
+                raise
+            except Exception:
+                desc = "[Encrypted content unavailable]"
+        return desc or ""
+
     async def list_reports(
         self,
         db: AsyncSession,
@@ -167,8 +194,45 @@ class ModeratorService:
             filters.append(Report.created_at <= date_to)
 
         if search and search.strip():
-            safe_search = f"%{escape_like_string(search.strip())}%"
-            filters.append(Report.description.ilike(safe_search, escape="\\"))
+            # In Phase 18, report description is stored encrypted at rest.
+            # To support search across both legacy and encrypted reports,
+            # query candidate IDs and decrypt candidate descriptions.
+            stmt_cand = sa.select(
+                Report.id,
+                Report.description,
+                Report.description_encrypted,
+                Report.description_iv,
+                Report.description_tag,
+                Report.description_aad_version,
+            ).where(*filters)
+            res_cand = await db.execute(stmt_cand)
+            cand_rows = res_cand.all()
+            matched_ids = []
+            search_term = search.strip().lower()
+            for crow in cand_rows:
+                cdesc = crow.description
+                if cdesc is None and crow.description_encrypted is not None:
+                    try:
+                        cdesc = await payload_encryption_service.decrypt_payload(
+                            db=db,
+                            report_id=crow.id,
+                            object_type="REPORT",
+                            object_id=crow.id,
+                            field_name="description",
+                            ciphertext=crow.description_encrypted,
+                            iv=crow.description_iv,
+                            tag=crow.description_tag,
+                            aad_version=crow.description_aad_version,
+                            context=DecryptionContext.MODERATOR_CASE_READ,
+                        )
+                    except Exception:
+                        cdesc = None
+                if cdesc and search_term in cdesc.lower():
+                    matched_ids.append(crow.id)
+            if matched_ids:
+                filters.append(Report.id.in_(matched_ids))
+            else:
+                filters.append(sa.sql.false())
 
         if has_evidence is not None:
             if has_evidence:
@@ -228,21 +292,57 @@ class ModeratorService:
         result = await db.execute(stmt)
         rows = result.all()
 
-        items = [
-            ModeratorReportResponse(
-                id=row.id,
-                category=row.category,
-                description=row.description,
-                evidence_url=row.evidence_url,
-                status=row.status,
-                priority=row.priority,
-                assigned_to=row.assigned_to,
-                version_id=row.version_id,
-                created_at=row.created_at,
-                updated_at=row.updated_at,
+        row_ids = [r.id for r in rows]
+        enc_map = {}
+        if row_ids:
+            stmt_enc = sa.select(
+                Report.id,
+                Report.description_encrypted,
+                Report.description_iv,
+                Report.description_tag,
+                Report.description_aad_version,
+            ).where(Report.id.in_(row_ids))
+            res_enc = await db.execute(stmt_enc)
+            for erow in res_enc.all():
+                enc_map[erow.id] = erow
+
+        items = []
+        for row in rows:
+            desc = row.description
+            if desc is None and row.id in enc_map:
+                erow = enc_map[row.id]
+                if erow.description_encrypted is not None:
+                    try:
+                        desc = await payload_encryption_service.decrypt_payload(
+                            db=db,
+                            report_id=row.id,
+                            object_type="REPORT",
+                            object_id=row.id,
+                            field_name="description",
+                            ciphertext=erow.description_encrypted,
+                            iv=erow.description_iv,
+                            tag=erow.description_tag,
+                            aad_version=erow.description_aad_version,
+                            context=DecryptionContext.MODERATOR_CASE_READ,
+                        )
+                    except HTTPException:
+                        raise
+                    except Exception:
+                        desc = "[Encrypted content unavailable]"
+            items.append(
+                ModeratorReportResponse(
+                    id=row.id,
+                    category=row.category,
+                    description=desc or "",
+                    evidence_url=row.evidence_url,
+                    status=row.status,
+                    priority=row.priority,
+                    assigned_to=row.assigned_to,
+                    version_id=row.version_id,
+                    created_at=row.created_at,
+                    updated_at=row.updated_at,
+                )
             )
-            for row in rows
-        ]
 
         return items, total
 
@@ -251,7 +351,7 @@ class ModeratorService:
         db: AsyncSession,
         report_id: uuid.UUID,
     ) -> Optional[ModeratorReportResponse]:
-        """Retrieve a single report by internal UUID with least-privilege column selection."""
+        """Retrieve a single report by internal UUID with least-privilege column selection and ALEE decryption."""
         stmt = sa.select(
             Report.id,
             Report.category,
@@ -270,10 +370,39 @@ class ModeratorService:
         if row is None:
             return None
 
+        desc = row.description
+        if desc is None:
+            stmt_enc = sa.select(
+                Report.description_encrypted,
+                Report.description_iv,
+                Report.description_tag,
+                Report.description_aad_version,
+            ).where(Report.id == report_id)
+            res_enc = await db.execute(stmt_enc)
+            erow = res_enc.one_or_none()
+            if erow and erow.description_encrypted is not None:
+                try:
+                    desc = await payload_encryption_service.decrypt_payload(
+                        db=db,
+                        report_id=row.id,
+                        object_type="REPORT",
+                        object_id=row.id,
+                        field_name="description",
+                        ciphertext=erow.description_encrypted,
+                        iv=erow.description_iv,
+                        tag=erow.description_tag,
+                        aad_version=erow.description_aad_version,
+                        context=DecryptionContext.MODERATOR_CASE_READ,
+                    )
+                except HTTPException:
+                    raise
+                except Exception:
+                    desc = "[Encrypted content unavailable]"
+
         return ModeratorReportResponse(
             id=row.id,
             category=row.category,
-            description=row.description,
+            description=desc or "",
             evidence_url=row.evidence_url,
             status=row.status,
             priority=row.priority,
@@ -289,10 +418,25 @@ class ModeratorService:
         report_id: uuid.UUID,
     ) -> Optional[ModeratorReportDetailResponse]:
         """Retrieve a report with its chronological public updates and internal notes."""
-        report_summary = await self.get_report_by_id(db, report_id)
-        if report_summary is None:
+        # Statement 0: Query Report least-privilege columns
+        stmt_report = sa.select(
+            Report.id,
+            Report.category,
+            Report.description,
+            Report.evidence_url,
+            Report.status,
+            Report.priority,
+            Report.assigned_to,
+            Report.version_id,
+            Report.created_at,
+            Report.updated_at,
+        ).where(Report.id == report_id)
+        res_report = await db.execute(stmt_report)
+        row = res_report.one_or_none()
+        if row is None:
             return None
 
+        # Statement 1: Query ReportUpdate least-privilege columns
         stmt_updates = (
             sa.select(
                 ReportUpdate.id,
@@ -307,28 +451,97 @@ class ModeratorService:
         res_updates = await db.execute(stmt_updates)
         update_rows = res_updates.all()
 
-        update_responses = [
-            ModeratorUpdateResponse(
-                id=u.id,
-                message=u.message,
-                type=u.type,
-                created_at=u.created_at,
-                created_by=u.created_by,
+        # Decrypt report description if encrypted
+        desc = row.description
+        if desc is None:
+            stmt_enc_rep = sa.select(
+                Report.description_encrypted,
+                Report.description_iv,
+                Report.description_tag,
+                Report.description_aad_version,
+            ).where(Report.id == report_id)
+            res_enc_rep = await db.execute(stmt_enc_rep)
+            erow_rep = res_enc_rep.one_or_none()
+            if erow_rep and erow_rep.description_encrypted is not None:
+                try:
+                    desc = await payload_encryption_service.decrypt_payload(
+                        db=db,
+                        report_id=row.id,
+                        object_type="REPORT",
+                        object_id=row.id,
+                        field_name="description",
+                        ciphertext=erow_rep.description_encrypted,
+                        iv=erow_rep.description_iv,
+                        tag=erow_rep.description_tag,
+                        aad_version=erow_rep.description_aad_version,
+                        context=DecryptionContext.MODERATOR_CASE_READ,
+                    )
+                except HTTPException:
+                    raise
+                except Exception:
+                    desc = "[Encrypted content unavailable]"
+
+        has_enc = any(u.message is None for u in update_rows)
+        enc_map = {}
+        if has_enc:
+            stmt_enc = (
+                sa.select(
+                    ReportUpdate.id,
+                    ReportUpdate.message_encrypted,
+                    ReportUpdate.message_iv,
+                    ReportUpdate.message_tag,
+                    ReportUpdate.message_aad_version,
+                )
+                .where(ReportUpdate.report_id == report_id)
             )
-            for u in update_rows
-        ]
+            res_enc = await db.execute(stmt_enc)
+            for erow in res_enc.all():
+                enc_map[erow.id] = erow
+
+        update_responses = []
+        for u in update_rows:
+            msg_text = u.message
+            if msg_text is None and u.id in enc_map:
+                erow = enc_map[u.id]
+                if erow.message_encrypted is not None:
+                    try:
+                        msg_text = await payload_encryption_service.decrypt_payload(
+                            db=db,
+                            report_id=report_id,
+                            object_type="REPORT_UPDATE",
+                            object_id=u.id,
+                            field_name="message",
+                            ciphertext=erow.message_encrypted,
+                            iv=erow.message_iv,
+                            tag=erow.message_tag,
+                            aad_version=erow.message_aad_version,
+                            context=DecryptionContext.MODERATOR_CASE_READ,
+                        )
+                    except HTTPException:
+                        raise
+                    except Exception:
+                        msg_text = "[Encrypted update unavailable]"
+            update_responses.append(
+                ModeratorUpdateResponse(
+                    id=u.id,
+                    message=msg_text or "",
+                    type=u.type,
+                    created_at=u.created_at,
+                    created_by=u.created_by,
+                )
+            )
 
         return ModeratorReportDetailResponse(
-            id=report_summary.id,
-            category=report_summary.category,
-            description=report_summary.description,
-            evidence_url=report_summary.evidence_url,
-            status=report_summary.status,
-            priority=report_summary.priority,
-            assigned_to=report_summary.assigned_to,
-            version_id=report_summary.version_id,
-            created_at=report_summary.created_at,
-            updated_at=report_summary.updated_at,
+            id=row.id,
+            category=row.category,
+            description=desc or "",
+            evidence_url=row.evidence_url,
+            status=row.status,
+            priority=row.priority,
+            assigned_to=row.assigned_to,
+            version_id=row.version_id,
+            created_at=row.created_at,
+            updated_at=row.updated_at,
             updates=update_responses,
         )
 
@@ -452,10 +665,11 @@ class ModeratorService:
                 report.version_id,
             )
 
+            desc = await self._decrypt_report_desc(db, report)
             return ModeratorReportResponse(
                 id=report.id,
                 category=report.category,
-                description=report.description,
+                description=desc,
                 evidence_url=report.evidence_url,
                 status=report.status,
                 priority=report.priority,
@@ -568,10 +782,11 @@ class ModeratorService:
                 report.version_id,
             )
 
+            desc = await self._decrypt_report_desc(db, report)
             return ModeratorReportResponse(
                 id=report.id,
                 category=report.category,
-                description=report.description,
+                description=desc,
                 evidence_url=report.evidence_url,
                 status=report.status,
                 priority=report.priority,
@@ -679,10 +894,11 @@ class ModeratorService:
                 report.version_id,
             )
 
+            desc = await self._decrypt_report_desc(db, report)
             return ModeratorReportResponse(
                 id=report.id,
                 category=report.category,
-                description=report.description,
+                description=desc,
                 evidence_url=report.evidence_url,
                 status=report.status,
                 priority=report.priority,
@@ -735,12 +951,27 @@ class ModeratorService:
 
             update = ReportUpdate(
                 report_id=report.id,
-                message=message,
+                message=None,
                 type=update_type,
                 created_by=moderator_id,
             )
             db.add(update)
             await db.flush()
+
+            # Phase 18: Encrypt update message using ALEE
+            if message:
+                ciphertext, iv, tag, key_version = await payload_encryption_service.encrypt_payload(
+                    db=db,
+                    report_id=report.id,
+                    object_type="REPORT_UPDATE",
+                    object_id=update.id,
+                    field_name="message",
+                    plaintext=message,
+                )
+                update.message_encrypted = ciphertext
+                update.message_iv = iv
+                update.message_tag = tag
+                update.message_aad_version = key_version
 
             await audit_service.append_entry(
                 db=db,
@@ -769,7 +1000,7 @@ class ModeratorService:
 
             return ModeratorUpdateResponse(
                 id=update.id,
-                message=update.message,
+                message=message,
                 type=update.type,
                 created_at=update.created_at,
                 created_by=update.created_by,

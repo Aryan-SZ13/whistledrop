@@ -51,3 +51,8 @@ data/
 *.sqlite3
 *.db
 evidence_storage/
+
+# Node / Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.cache/

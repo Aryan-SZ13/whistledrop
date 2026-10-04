@@ -95,6 +95,10 @@ class RetentionService:
             att.kek_key_id = None
             att.updated_at = now
 
+        # Phase 18: Unified Cryptographic Erasure - destroy case payload encryption DEK
+        from app.services.payload_encryption_service import payload_encryption_service
+        await payload_encryption_service.destroy_case_dek(db, report_id)
+
         audit_entry_1 = None
         audit_entry_2 = None
 
@@ -308,19 +312,27 @@ class RetentionService:
 
                         shred_time = datetime.now(timezone.utc)
 
-                        # Redact report description
+                        # Redact report description and clear encrypted fields
                         report.description = "[REDACTED PURSUANT TO DATA RETENTION/WITHDRAWAL POLICY]"
+                        report.description_encrypted = None
+                        report.description_iv = None
+                        report.description_tag = None
+                        report.description_aad_version = None
                         report.is_shredded = True
                         report.shredded_at = shred_time
                         report.version_id += 1
                         report.updated_at = shred_time
 
-                        # Redact channel messages
+                        # Redact channel messages and clear encrypted fields
                         stmt_msgs = (
                             sa.update(CaseMessage)
                             .where(CaseMessage.report_id == report_id)
                             .values(
                                 content="[REDACTED PURSUANT TO DATA RETENTION/WITHDRAWAL POLICY]",
+                                content_encrypted=None,
+                                content_iv=None,
+                                content_tag=None,
+                                content_aad_version=None,
                             )
                         )
                         await case_db.execute(stmt_msgs)
@@ -341,6 +353,10 @@ class RetentionService:
                             ev.dek_tag = None
                             ev.kek_key_id = None
                             ev.updated_at = shred_time
+
+                        # Phase 18: Unified Cryptographic Erasure - destroy case payload encryption DEK
+                        from app.services.payload_encryption_service import payload_encryption_service
+                        await payload_encryption_service.destroy_case_dek(case_db, report_id)
 
                         # Append tamper-evident chained audit tombstone
                         await audit_service.append_entry(

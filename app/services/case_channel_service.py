@@ -21,6 +21,10 @@ from app.models.enums import MessageSenderType, ReportStatus
 from app.models.moderator import Moderator
 from app.models.report import Report
 from app.services.audit_service import audit_service
+from app.services.payload_encryption_service import (
+    DecryptionContext,
+    payload_encryption_service,
+)
 from app.schemas.case_message import (
     CaseMessageListResponse,
     CaseMessageResponse,
@@ -392,6 +396,7 @@ class CaseChannelService:
                 res = await db.execute(stmt_cached)
                 cached_msg = res.scalar_one_or_none()
                 if cached_msg:
+                    cached_msg.content = cached_resp.get("content") or content
                     return cached_msg, True
 
         try:
@@ -422,21 +427,40 @@ class CaseChannelService:
                 existing_msg = res_existing.scalar_one_or_none()
 
                 if existing_msg:
-                    existing_hash = hashlib.sha256(existing_msg.content.encode("utf-8")).hexdigest()
-                    if existing_hash != content_hash:
-                        raise HTTPException(
-                            status_code=status.HTTP_409_CONFLICT,
-                            detail="Idempotency key reused with different payload.",
-                        )
+                    raw_content = existing_msg.content
+                    if raw_content is None and existing_msg.content_encrypted is not None:
+                        try:
+                            raw_content = await payload_encryption_service.decrypt_payload(
+                                db=db,
+                                report_id=report_id,
+                                object_type="CASE_MESSAGE",
+                                object_id=existing_msg.id,
+                                field_name="content",
+                                ciphertext=existing_msg.content_encrypted,
+                                iv=existing_msg.content_iv,
+                                tag=existing_msg.content_tag,
+                                aad_version=existing_msg.content_aad_version,
+                                context=DecryptionContext.ANONYMOUS_PUBLIC_UPDATE,
+                            )
+                        except Exception:
+                            raw_content = None
+                    if raw_content is not None:
+                        existing_hash = hashlib.sha256(raw_content.encode("utf-8")).hexdigest()
+                        if existing_hash != content_hash:
+                            raise HTTPException(
+                                status_code=status.HTTP_409_CONFLICT,
+                                detail="Idempotency key reused with different payload.",
+                            )
                     # Reconstruct completed Redis state
                     resp_dict = {
                         "id": existing_msg.public_id,
                         "sender": existing_msg.sender_type.value,
-                        "content": existing_msg.content,
+                        "content": raw_content or content,
                         "created_at": existing_msg.created_at.isoformat(),
                     }
                     if redis_key and owner_token:
                         await self.finalize_idempotency_completed(redis_key, owner_token, content, resp_dict)
+                    existing_msg.content = raw_content or content
                     return existing_msg, True
 
             # 4. Insert message
@@ -447,9 +471,25 @@ class CaseChannelService:
                 sender_type=sender_type,
                 moderator_id=moderator.id if moderator else None,
                 idempotency_key=idempotency_key,
-                content=content,
+                content=None,
             )
             db.add(msg)
+            await db.flush()
+
+            # Phase 18: ALEE payload encryption for message content
+            if content:
+                enc_ct, enc_iv, enc_tag, enc_ver = await payload_encryption_service.encrypt_payload(
+                    db=db,
+                    report_id=report_id,
+                    object_type="CASE_MESSAGE",
+                    object_id=msg.id,
+                    field_name="content",
+                    plaintext=content,
+                )
+                msg.content_encrypted = enc_ct
+                msg.content_iv = enc_iv
+                msg.content_tag = enc_tag
+                msg.content_aad_version = enc_ver
 
             # 5. Update report metadata
             now = datetime.now(timezone.utc)
@@ -487,13 +527,14 @@ class CaseChannelService:
 
             await db.commit()
             await db.refresh(msg)
+            msg.content = content
 
             # 7. Finalize Redis idempotency key
             if redis_key and owner_token:
                 resp_dict = {
                     "id": msg.public_id,
                     "sender": msg.sender_type.value,
-                    "content": msg.content,
+                    "content": content,
                     "created_at": msg.created_at.isoformat(),
                 }
                 await self.finalize_idempotency_completed(redis_key, owner_token, content, resp_dict)
@@ -520,6 +561,13 @@ class CaseChannelService:
         moderator_id: Optional[uuid.UUID] = None,
     ) -> CaseMessageListResponse:
         """List messages in chronological order with authenticated keyset pagination."""
+        if caller_sender_type == MessageSenderType.MODERATOR:
+            from app.services.canary_service import canary_service
+            if await canary_service.is_system_sealed(db):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="System is in sealed mode; operator message inspection disabled",
+                )
         query = sa.select(CaseMessage).where(CaseMessage.report_id == report_id)
 
         if cursor:
@@ -565,16 +613,38 @@ class CaseChannelService:
             moderator_id=moderator_id,
         )
 
-        return CaseMessageListResponse(
-            items=[
+        items_responses = []
+        for m in items:
+            msg_text = m.content
+            if msg_text is None and m.content_encrypted is not None:
+                ctx = (
+                    DecryptionContext.ANONYMOUS_PUBLIC_UPDATE
+                    if caller_sender_type == MessageSenderType.REPORTER
+                    else DecryptionContext.MODERATOR_MESSAGE_READ
+                )
+                msg_text = await payload_encryption_service.decrypt_payload(
+                    db=db,
+                    report_id=report_id,
+                    object_type="CASE_MESSAGE",
+                    object_id=m.id,
+                    field_name="content",
+                    ciphertext=m.content_encrypted,
+                    iv=m.content_iv,
+                    tag=m.content_tag,
+                    aad_version=m.content_aad_version,
+                    context=ctx,
+                )
+            items_responses.append(
                 CaseMessageResponse(
                     id=m.public_id,
                     sender=m.sender_type.value,
-                    content=m.content,
+                    content=msg_text or "",
                     created_at=m.created_at,
                 )
-                for m in items
-            ],
+            )
+
+        return CaseMessageListResponse(
+            items=items_responses,
             next_cursor=next_cursor,
             has_more=has_more,
             total_unread=total_unread,

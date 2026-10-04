@@ -9,7 +9,7 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.background import BackgroundTask
 
-from app.api.deps import require_moderator
+from app.api.deps import require_admin, require_moderator
 from app.core.client_ip import resolve_client_ip
 from app.core.config import settings
 from app.db.session import async_session_maker, get_db
@@ -76,6 +76,10 @@ from app.services.rate_limiter import (
     RateLimitUnavailableError,
     rate_limiter,
 )
+from app.schemas.canary import AdminCheckInRequest, EmergencySealRequest, SecurityStateResponse
+from app.services.canary_service import canary_service
+from app.services.mfa_service import mfa_service
+from app.services.payload_encryption_service import payload_encryption_service
 from app.services.retention_service import retention_service
 
 logger = logging.getLogger(__name__)
@@ -702,3 +706,102 @@ async def execute_retention_sweep(
                 detail="Retention lock service unavailable.",
             )
         raise
+
+
+@router.post(
+    "/reports/{report_id}/rewrap-keys",
+    status_code=status.HTTP_200_OK,
+    summary="Rewrap Case Data Encryption Key under Active KEK",
+)
+async def rewrap_case_key(
+    report_id: uuid.UUID = Path(..., description="Target Report ID"),
+    current_moderator: Moderator = Depends(require_moderator),
+    db: AsyncSession = Depends(get_db),
+):
+    new_version = await payload_encryption_service.rewrap_case_dek(db, report_id)
+    await db.commit()
+    return {
+        "report_id": str(report_id),
+        "status": "rewrapped",
+        "active_version": new_version,
+        "new_key_version": new_version,
+    }
+
+
+@router.post(
+    "/security/check-in",
+    status_code=status.HTTP_200_OK,
+    summary="Dead-Man's Switch Administrator Check-In",
+)
+async def admin_check_in(
+    payload: AdminCheckInRequest,
+    current_admin: Moderator = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    if not current_admin.is_totp_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Admin must have MFA enabled to perform check-in",
+        )
+    is_valid = await mfa_service.verify_totp_or_recovery_code(db, current_admin, payload.totp_code)
+    if not is_valid:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid MFA code",
+        )
+    next_due = await canary_service.admin_check_in(db, current_admin.id)
+    return {"status": "ok", "next_due_at": next_due.isoformat()}
+
+
+@router.post(
+    "/security/emergency-seal",
+    status_code=status.HTTP_200_OK,
+    summary="Engage Emergency Access Sealing",
+)
+async def emergency_seal(
+    payload: EmergencySealRequest,
+    current_admin: Moderator = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    state = await canary_service.execute_emergency_seal(
+        db=db,
+        initiator_id=current_admin.id,
+        reason=payload.reason,
+    )
+    await db.commit()
+    return {
+        "status": "sealed",
+        "sealed_at": state.sealed_at.isoformat() if state.sealed_at else None,
+        "reason": state.seal_reason,
+    }
+
+
+@router.post(
+    "/security/emergency-unseal",
+    status_code=status.HTTP_200_OK,
+    summary="Disengage Emergency Access Sealing",
+)
+async def emergency_unseal(
+    current_admin: Moderator = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    await canary_service.execute_emergency_unseal(
+        db=db,
+        approver_id=current_admin.id,
+    )
+    await db.commit()
+    return {"status": "unsealed"}
+
+
+@router.get(
+    "/security/state",
+    response_model=SecurityStateResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Get System Security State",
+)
+async def get_security_state(
+    current_moderator: Moderator = Depends(require_moderator),
+    db: AsyncSession = Depends(get_db),
+):
+    state = await canary_service.get_or_create_security_state(db)
+    return state

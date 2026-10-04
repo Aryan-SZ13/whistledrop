@@ -100,7 +100,8 @@ async def test_plaintext_case_code_absent_from_database(
     audit_dump = str(audit.metadata_) + str(audit.action)
     assert plaintext_case_code not in audit_dump
     assert expected_digest not in audit_dump
-    assert report.description not in audit_dump
+    if report.description is not None:
+        assert report.description not in audit_dump
 
 
 def test_submit_report_forbids_extra_fields(client: TestClient):

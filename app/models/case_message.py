@@ -53,9 +53,25 @@ class CaseMessage(Base):
         sa.String(64),
         nullable=True,
     )
-    content: Mapped[str] = mapped_column(
+    content: Mapped[Optional[str]] = mapped_column(
         sa.Text,
-        nullable=False,
+        nullable=True,
+    )
+    content_encrypted: Mapped[Optional[bytes]] = mapped_column(
+        sa.LargeBinary,
+        nullable=True,
+    )
+    content_iv: Mapped[Optional[bytes]] = mapped_column(
+        sa.LargeBinary,
+        nullable=True,
+    )
+    content_tag: Mapped[Optional[bytes]] = mapped_column(
+        sa.LargeBinary,
+        nullable=True,
+    )
+    content_aad_version: Mapped[Optional[int]] = mapped_column(
+        sa.Integer,
+        nullable=True,
     )
     created_at: Mapped[datetime] = mapped_column(
         sa.DateTime(timezone=True),
@@ -70,7 +86,7 @@ class CaseMessage(Base):
 
     __table_args__ = (
         sa.CheckConstraint(
-            "char_length(content) >= 1 AND char_length(content) <= 5000",
+            "content IS NULL OR (char_length(content) >= 1 AND char_length(content) <= 5000)",
             name="chk_message_content_length",
         ),
         sa.CheckConstraint(

@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from app.models.audit_log import AuditLog
     from app.models.evidence import EvidenceAttachment
     from app.models.moderator import Moderator
+    from app.models.encryption import CaseEncryptionKey
 
 
 class Report(Base):
@@ -38,9 +39,25 @@ class Report(Base):
         nullable=False,
         index=True,
     )
-    description: Mapped[str] = mapped_column(
+    description: Mapped[Optional[str]] = mapped_column(
         sa.Text,
-        nullable=False,
+        nullable=True,
+    )
+    description_encrypted: Mapped[Optional[bytes]] = mapped_column(
+        sa.LargeBinary,
+        nullable=True,
+    )
+    description_iv: Mapped[Optional[bytes]] = mapped_column(
+        sa.LargeBinary,
+        nullable=True,
+    )
+    description_tag: Mapped[Optional[bytes]] = mapped_column(
+        sa.LargeBinary,
+        nullable=True,
+    )
+    description_aad_version: Mapped[Optional[int]] = mapped_column(
+        sa.Integer,
+        nullable=True,
     )
     evidence_url: Mapped[Optional[str]] = mapped_column(
         sa.Text,
@@ -165,5 +182,11 @@ class Report(Base):
     moderator_read_states: Mapped[List["CaseMessageModeratorReadState"]] = relationship(
         "CaseMessageModeratorReadState",
         back_populates="report",
+        cascade="all, delete-orphan",
+    )
+    encryption_key: Mapped[Optional["CaseEncryptionKey"]] = relationship(
+        "CaseEncryptionKey",
+        back_populates="report",
+        uselist=False,
         cascade="all, delete-orphan",
     )

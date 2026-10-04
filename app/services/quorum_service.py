@@ -30,6 +30,9 @@ ALLOWLISTED_ACTIONS = {
     "MODERATOR_ROLE_CHANGE",
     "MODERATOR_DEACTIVATE",
     "WEBHOOK_ENDPOINT_DELETE",
+    "CANARY_REFRESH",
+    "EMERGENCY_SEAL",
+    "SYSTEM_UNSEAL",
 }
 
 
@@ -350,6 +353,36 @@ class QuorumService:
             target_mod = (await db.execute(sa.select(Moderator).where(Moderator.id == mod_id).with_for_update())).scalar_one()
             target_mod.is_active = False
             return {"moderator_id": str(mod_id), "is_active": False}
+
+        elif action == "CANARY_REFRESH":
+            from app.services.canary_service import canary_service
+            statement_text = params["statement_text"]
+            canary = await canary_service.execute_canary_publish(
+                db=db,
+                statement_text=statement_text,
+                proposer_id=proposal.proposed_by_id,
+                approver_id=context.approver_id,
+                quorum_request_id=proposal.id,
+            )
+            return {"canary_sequence": canary.canary_sequence, "status": "published"}
+
+        elif action == "EMERGENCY_SEAL":
+            from app.services.canary_service import canary_service
+            reason = params.get("reason", "Quorum-approved emergency seal")
+            state = await canary_service.execute_emergency_seal(
+                db=db,
+                initiator_id=proposal.proposed_by_id,
+                reason=reason,
+            )
+            return {"status": "SEALED", "sealed_at": state.sealed_at.isoformat() if state.sealed_at else None}
+
+        elif action == "SYSTEM_UNSEAL":
+            from app.services.canary_service import canary_service
+            state = await canary_service.execute_emergency_unseal(
+                db=db,
+                approver_id=context.approver_id,
+            )
+            return {"status": "ACTIVE"}
 
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unsupported action {action}")
 

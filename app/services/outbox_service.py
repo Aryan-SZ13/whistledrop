@@ -50,7 +50,10 @@ class OutboxService:
 
         if raw_data:
             # Strictly copy only safe whitelist metadata fields
-            allowed_fields = {"status", "category", "priority", "created_at", "action_type", "assigned"}
+            allowed_fields = {
+                "status", "category", "priority", "created_at", "action_type", "assigned",
+                "canary_sequence", "statement_hash", "valid_until", "sealed_at", "reason", "unsealed_at",
+            }
             for k, v in raw_data.items():
                 if k in allowed_fields and v is not None:
                     data_dict[k] = str(v) if not isinstance(v, (int, float, bool)) else v

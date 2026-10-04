@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import sqlalchemy as sa
 from cryptography.hazmat.primitives.asymmetric import ed25519
+from fastapi import HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -132,6 +133,13 @@ class CaseExportService:
         if report.is_shredded:
             raise CaseShreddedError("Cannot export shredded case: cryptographic keys and data have been destroyed.")
 
+        from app.services.canary_service import canary_service
+        if await canary_service.is_system_sealed(db):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="System is in sealed mode; sensitive case exports disabled.",
+            )
+
         export_uuid = uuid.uuid4()
         session_temp_dir = self.temp_dir / f"export_{export_uuid}"
         session_temp_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -180,11 +188,30 @@ class CaseExportService:
             res_ev = await db.execute(stmt_ev)
             evidence_attachments = res_ev.scalars().all()
 
-            # 2. Write Snapshot Files
+            # 2. Write Snapshot Files with ALEE payload decryption
+            from app.services.payload_encryption_service import DecryptionContext, payload_encryption_service
+            description_text = report.description
+            if description_text is None and report.description_encrypted is not None:
+                try:
+                    description_text = await payload_encryption_service.decrypt_payload(
+                        db=db,
+                        report_id=report.id,
+                        object_type="REPORT",
+                        object_id=report.id,
+                        field_name="description",
+                        ciphertext=report.description_encrypted,
+                        iv=report.description_iv,
+                        tag=report.description_tag,
+                        aad_version=report.description_aad_version,
+                        context=DecryptionContext.EXPORT,
+                    )
+                except Exception:
+                    description_text = "[Cryptographically shredded]"
+
             metadata_dict = {
                 "id": str(report.id),
                 "category": report.category.value,
-                "description": report.description,
+                "description": description_text,
                 "status": report.status.value,
                 "priority": report.priority.value,
                 "created_at": report.created_at.isoformat(),
@@ -209,16 +236,32 @@ class CaseExportService:
                 json.dumps(metadata_dict, indent=2, sort_keys=True), encoding="utf-8"
             )
 
-            messages_list = [
-                {
+            messages_list = []
+            for m in messages:
+                m_content = m.content
+                if m_content is None and m.content_encrypted is not None:
+                    try:
+                        m_content = await payload_encryption_service.decrypt_payload(
+                            db=db,
+                            report_id=report_id,
+                            object_type="CASE_MESSAGE",
+                            object_id=m.id,
+                            field_name="content",
+                            ciphertext=m.content_encrypted,
+                            iv=m.content_iv,
+                            tag=m.content_tag,
+                            aad_version=m.content_aad_version,
+                            context=DecryptionContext.EXPORT,
+                        )
+                    except Exception:
+                        m_content = "[Cryptographically shredded]"
+                messages_list.append({
                     "id": str(m.id),
                     "public_id": m.public_id,
                     "sender_type": m.sender_type.value,
-                    "content": m.content,
+                    "content": m_content,
                     "created_at": m.created_at.isoformat(),
-                }
-                for m in messages
-            ]
+                })
             (session_temp_dir / "channel_messages.json").write_text(
                 json.dumps(messages_list, indent=2, sort_keys=True), encoding="utf-8"
             )
