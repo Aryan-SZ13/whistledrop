@@ -1,0 +1,6 @@
+operation,short_name,iterations,p50_ms,p95_ms,p99_ms,mean_ms,throughput_ops_sec,target_p95_ms,methodology
+ALEE AES-256-GCM Decryption,ALEE Decrypt,50,0.61,1.32,4.02,0.72,1386.7,10.0,Sequential local microbenchmark
+ALEE AES-256-GCM Encryption,ALEE Encrypt,50,0.97,1.47,5.87,1.07,933.7,10.0,Sequential local microbenchmark
+Anonymous Case Tracking,Case Tracking,25,1.11,5.98,7.43,1.99,501.5,100.0,Sequential local microbenchmark
+Merkle Leaf Commitment,Merkle Leaf,50,1.80,4.81,36.48,2.97,336.5,15.0,Sequential local microbenchmark
+Full Report Ingestion Pipeline,Full Ingestion,25,8.48,20.86,28.20,10.55,94.8,300.0,Sequential local microbenchmark

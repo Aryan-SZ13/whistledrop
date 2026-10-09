@@ -1,7 +1,9 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo, useRef } from 'react';
 import { Shield, Key, Copy, Check, ArrowRight, Upload, FileText } from 'lucide-react';
 import { submitReport, uploadEvidence } from '../api/reports';
 import { Alert } from '../components/Alert';
+import { PrivacyPreflightBanner } from '../components/PrivacyPreflightBanner';
+import { scanDraftText } from '../utils/privacyPreflight';
 import { useAnonymous } from '../context/AnonymousContext';
 import type { ReportCategory } from '../types';
 
@@ -29,6 +31,22 @@ export const SubmitReportPage: React.FC<SubmitReportPageProps> = ({ onNavigateTo
   const [category, setCategory] = useState<ReportCategory>('FINANCIAL_MISCONDUCT');
   const [description, setDescription] = useState('');
   const [files, setFiles] = useState<File[]>([]);
+  const [preflightAcknowledged, setPreflightAcknowledged] = useState(false);
+  const descriptionRef = useRef<HTMLTextAreaElement>(null);
+
+  const preflightResult = useMemo(() => {
+    try {
+      return scanDraftText(`${title}\n${description}`);
+    } catch {
+      return {
+        findings: [],
+        hasWarnings: false,
+        criticalCount: 0,
+        scanDurationMs: 0,
+        scannedLength: (title + description).length,
+      };
+    }
+  }, [title, description]);
 
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -76,6 +94,14 @@ export const SubmitReportPage: React.FC<SubmitReportPageProps> = ({ onNavigateTo
     }
     if (description.trim().length < 10) {
       setError('Description must be at least 10 characters.');
+      return;
+    }
+
+    if (preflightResult.hasWarnings && !preflightAcknowledged) {
+      setError(
+        'Privacy Preflight: Potential identifying details were detected in your narrative. Please review the advisory above and check "This is incident evidence (allow submission)" or edit your narrative before submitting.'
+      );
+      descriptionRef.current?.focus();
       return;
     }
 
@@ -233,7 +259,7 @@ export const SubmitReportPage: React.FC<SubmitReportPageProps> = ({ onNavigateTo
           Submit Confidential Report
         </h1>
         <p style={{ color: 'var(--text-muted)', marginTop: '0.4rem', fontSize: '0.95rem' }}>
-          Submit critical disclosures with mathematical privacy guarantees. No accounts, no IP logging, and zero-knowledge tracking.
+          Submit critical disclosures with strong cryptographic privacy guarantees. No accounts, no IP logging, and anonymous case tracking.
         </p>
       </div>
 
@@ -286,6 +312,7 @@ export const SubmitReportPage: React.FC<SubmitReportPageProps> = ({ onNavigateTo
                 Detailed Narrative *
               </label>
               <textarea
+                ref={descriptionRef}
                 rows={6}
                 placeholder="Provide factual details: what occurred, timeline, entities involved, and locations. Do NOT include your own personal identity."
                 value={description}
@@ -362,13 +389,28 @@ export const SubmitReportPage: React.FC<SubmitReportPageProps> = ({ onNavigateTo
               )}
             </div>
 
+            <PrivacyPreflightBanner
+              scanResult={preflightResult}
+              onFocusDescription={() => descriptionRef.current?.focus()}
+              acknowledged={preflightAcknowledged}
+              onToggleAcknowledge={setPreflightAcknowledged}
+            />
+
             <button
               type="submit"
               disabled={submitting}
               className="btn btn-primary"
-              style={{ width: '100%', padding: '0.75rem' }}
+              style={{
+                width: '100%',
+                padding: '0.75rem',
+                opacity: submitting ? 0.7 : 1,
+              }}
             >
-              {submitting ? 'Encrypting & Transmitting...' : 'Submit Confidential Report'}
+              {submitting
+                ? 'Encrypting & Transmitting...'
+                : preflightResult.hasWarnings && !preflightAcknowledged
+                ? 'Review Advisory & Submit'
+                : 'Submit Confidential Report'}
             </button>
           </form>
         </div>

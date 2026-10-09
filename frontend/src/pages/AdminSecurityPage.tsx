@@ -117,10 +117,11 @@ export const AdminSecurityPage: React.FC = () => {
 
   const handleEmergencyUnseal = async () => {
     if (!token) return;
-    if (!window.confirm('Are you sure you want to disengage emergency access sealing?')) return;
+    const totp = window.prompt('Enter your 6-digit MFA TOTP code to confirm emergency unseal:');
+    if (!totp) return;
 
     try {
-      await emergencyUnseal(token);
+      await emergencyUnseal(token, totp.trim());
       setSuccess('Emergency seal disengaged. Standard operator access restored.');
       fetchSecurityData();
     } catch (err: unknown) {

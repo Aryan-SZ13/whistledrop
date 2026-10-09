@@ -23,18 +23,7 @@ async def get_latest_canary(
     if canary is None:
         return None
     now = datetime.now(timezone.utc)
-    is_current = now <= canary.valid_until
-    return CanaryResponse(
-        canary_sequence=canary.canary_sequence,
-        statement_text=canary.statement_text,
-        statement_hash=canary.statement_hash,
-        valid_from=canary.valid_from,
-        valid_until=canary.valid_until,
-        published_at=canary.published_at,
-        is_current=is_current,
-        signature=canary.signature,
-        signing_key_id=canary.signing_key_id,
-    )
+    return CanaryResponse.from_canary(canary, now=now)
 
 
 @router.get("/history", response_model=List[CanaryResponse])
@@ -50,17 +39,4 @@ async def get_canary_history(
     response.headers["Expires"] = "0"
     canaries = await canary_service.get_canary_history(db, limit=limit, offset=offset)
     now = datetime.now(timezone.utc)
-    return [
-        CanaryResponse(
-            canary_sequence=c.canary_sequence,
-            statement_text=c.statement_text,
-            statement_hash=c.statement_hash,
-            valid_from=c.valid_from,
-            valid_until=c.valid_until,
-            published_at=c.published_at,
-            is_current=now <= c.valid_until,
-            signature=c.signature,
-            signing_key_id=c.signing_key_id,
-        )
-        for c in canaries
-    ]
+    return [CanaryResponse.from_canary(c, now=now) for c in canaries]

@@ -233,6 +233,12 @@ class PayloadEncryptionService:
         report_id: uuid.UUID,
     ) -> None:
         """Transactionally zeroes out and marks destroyed the case DEK."""
+        from app.services.canary_service import canary_service
+        if await canary_service.is_system_sealed(db):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="System is in sealed mode; key destruction and cryptographic erasure are disabled",
+            )
         self._evict_cache_entry(report_id)
         stmt = (
             sa.select(CaseEncryptionKey)

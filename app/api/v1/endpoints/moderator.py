@@ -76,7 +76,7 @@ from app.services.rate_limiter import (
     RateLimitUnavailableError,
     rate_limiter,
 )
-from app.schemas.canary import AdminCheckInRequest, EmergencySealRequest, SecurityStateResponse
+from app.schemas.canary import AdminCheckInRequest, EmergencySealRequest, EmergencyUnsealRequest, SecurityStateResponse
 from app.services.canary_service import canary_service
 from app.services.mfa_service import mfa_service
 from app.services.payload_encryption_service import payload_encryption_service
@@ -782,9 +782,23 @@ async def emergency_seal(
     summary="Disengage Emergency Access Sealing",
 )
 async def emergency_unseal(
+    payload: Optional[EmergencyUnsealRequest] = None,
     current_admin: Moderator = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
+    if current_admin.is_totp_enabled:
+        if not payload or not payload.totp_code:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Admin must provide a valid TOTP code to disengage emergency seal",
+            )
+        is_valid = await mfa_service.verify_totp_or_recovery_code(db, current_admin, payload.totp_code)
+        if not is_valid:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid MFA code",
+            )
+
     await canary_service.execute_emergency_unseal(
         db=db,
         approver_id=current_admin.id,

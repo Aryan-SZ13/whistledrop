@@ -425,6 +425,14 @@ class Settings(BaseSettings):
                 DEV_INSECURE_CURSOR_SECRET,
                 DEV_INSECURE_AUDIT_CHAIN_SECRET,
                 DEV_INSECURE_EVIDENCE_KEK_SECRET,
+                DEV_INSECURE_MFA_KEK_SECRET,
+                DEV_INSECURE_REFRESH_SECRET,
+                DEV_INSECURE_WEBHOOK_KEK_SECRET,
+                DEV_INSECURE_WEBHOOK_SALT,
+                DEV_INSECURE_PAYLOAD_KEK_1,
+                DEV_INSECURE_TRANSPARENCY_SALT,
+                DEV_INSECURE_EXPORT_SIGNING_KEY_ED25519_PRIVATE,
+                DEV_INSECURE_CANARY_SIGNING_KEY_ED25519_PRIVATE,
                 ENV_EXAMPLE_PLACEHOLDER_JWT,
                 ENV_EXAMPLE_PLACEHOLDER_CASE,
                 ENV_EXAMPLE_PLACEHOLDER_RATE_LIMIT,
@@ -455,6 +463,34 @@ class Settings(BaseSettings):
             if self.EVIDENCE_KEK_SECRET in insecure_placeholders or len(self.EVIDENCE_KEK_SECRET) < 32:
                 raise ValueError(
                     "Production requires a strong, unique EVIDENCE_KEK_SECRET of at least 32 characters."
+                )
+            if self.MFA_KEK_SECRET in insecure_placeholders or len(self.MFA_KEK_SECRET) < 32:
+                raise ValueError(
+                    "Production requires a strong, unique MFA_KEK_SECRET of at least 32 characters."
+                )
+            if self.REFRESH_SECRET in insecure_placeholders or len(self.REFRESH_SECRET) < 32:
+                raise ValueError(
+                    "Production requires a strong, unique REFRESH_SECRET of at least 32 characters."
+                )
+            if self.WEBHOOK_KEK_SECRET in insecure_placeholders or len(self.WEBHOOK_KEK_SECRET) < 32:
+                raise ValueError(
+                    "Production requires a strong, unique WEBHOOK_KEK_SECRET of at least 32 characters."
+                )
+            if self.WEBHOOK_SALT in insecure_placeholders or len(self.WEBHOOK_SALT) < 32:
+                raise ValueError(
+                    "Production requires a strong, unique WEBHOOK_SALT of at least 32 characters."
+                )
+            if active_payload_kek in insecure_placeholders or len(active_payload_kek) < 32:
+                raise ValueError(
+                    "Production requires a strong, unique active PAYLOAD_KEK_KEYRING entry of at least 32 characters."
+                )
+            if self.EXPORT_SIGNING_KEY_ED25519_PRIVATE in insecure_placeholders or len(self.EXPORT_SIGNING_KEY_ED25519_PRIVATE) < 32:
+                raise ValueError(
+                    "Production requires a strong, unique EXPORT_SIGNING_KEY_ED25519_PRIVATE key."
+                )
+            if self.CANARY_SIGNING_KEY_ED25519_PRIVATE in insecure_placeholders or len(self.CANARY_SIGNING_KEY_ED25519_PRIVATE) < 32:
+                raise ValueError(
+                    "Production requires a strong, unique CANARY_SIGNING_KEY_ED25519_PRIVATE key."
                 )
 
         # 5. Trusted Ed25519 Fingerprints derivation / verification

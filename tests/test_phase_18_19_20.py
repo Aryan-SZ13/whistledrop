@@ -482,7 +482,9 @@ async def test_emergency_seal_enforcement_boundary(client, db_session: AsyncSess
         db_session,
         ReportCreate(category=ReportCategory.CORRUPTION, description="Top secret executive corruption report."),
     )
-    mod, mod_headers = await create_test_moderator(db_session, "seal_audit_mod", role=ModeratorRole.ADMIN)
+    mod, mod_headers = await create_test_moderator(
+        db_session, "seal_audit_mod", role=ModeratorRole.ADMIN, is_totp_enabled=True
+    )
 
     # Add a public update before sealing
     await moderator_service.add_report_update(
@@ -527,6 +529,16 @@ async def test_emergency_seal_enforcement_boundary(client, db_session: AsyncSess
     res_mod_rewrap = client.post(f"/api/v1/moderator/reports/{report.id}/rewrap-keys", headers=mod_headers)
     assert res_mod_rewrap.status_code == 403
 
+    # 3e. Key destruction is BLOCKED with 403 during seal
+    with pytest.raises(Exception) as excinfo:
+        await payload_encryption_service.destroy_case_dek(db_session, report.id)
+    assert "403" in str(excinfo.value) or "sealed" in str(excinfo.value).lower()
+
+    # 3f. Retention sweep is BLOCKED/SKIPPED during seal
+    ret_res = await retention_service.execute_retention_sweep_internal(db_session)
+    assert ret_res.processed_count == 0
+    assert any("sealed" in str(d).lower() for d in ret_res.details)
+
     # --------------------------------------------------------------------------
     # VERIFY ALLOWED OPERATIONS FOR ANONYMOUS WHISTLEBLOWERS
     # --------------------------------------------------------------------------
@@ -569,7 +581,24 @@ async def test_emergency_seal_enforcement_boundary(client, db_session: AsyncSess
     # --------------------------------------------------------------------------
     # 5. DISENGAGE EMERGENCY SEAL & VERIFY RESTORATION
     # --------------------------------------------------------------------------
-    unseal_res = client.post("/api/v1/moderator/security/emergency-unseal", headers=mod_headers)
+    # Unseal without valid TOTP fails with 400 or 401
+    res_bad_unseal = client.post(
+        "/api/v1/moderator/security/emergency-unseal",
+        headers=mod_headers,
+        json={"totp_code": "000000"},
+    )
+    assert res_bad_unseal.status_code in (400, 401)
+
+    raw_secret = mfa_service.decrypt_secret(
+        mod.totp_secret_encrypted, mod.totp_secret_iv, mod.totp_secret_tag
+    )
+    valid_totp = get_totp_code(raw_secret)
+
+    unseal_res = client.post(
+        "/api/v1/moderator/security/emergency-unseal",
+        headers=mod_headers,
+        json={"totp_code": valid_totp},
+    )
     assert unseal_res.status_code == 200
     assert unseal_res.json()["status"] == "unsealed"
 
@@ -577,3 +606,41 @@ async def test_emergency_seal_enforcement_boundary(client, db_session: AsyncSess
     res_mod_restored = client.get(f"/api/v1/moderator/reports/{report.id}", headers=mod_headers)
     assert res_mod_restored.status_code == 200
     assert res_mod_restored.json()["description"] == "Top secret executive corruption report."
+
+
+def test_canary_from_canary_mapping_and_expiry_semantics():
+    """Verify CanaryResponse.from_canary preserves exact attributes, JSON serialization, and is_current expiry semantics."""
+    from datetime import datetime, timedelta, timezone
+    from app.schemas.canary import CanaryResponse
+
+    now = datetime(2026, 10, 9, 12, 0, 0, tzinfo=timezone.utc)
+
+    class MockCanary:
+        canary_sequence = 42
+        statement_text = "All systems operational; 0 government warrants received."
+        statement_hash = "abcdef1234567890" * 4
+        valid_from = now - timedelta(days=7)
+        valid_until = now + timedelta(days=7)
+        published_at = now - timedelta(days=7)
+        signature = "deadbeef" * 16
+        signing_key_id = "canary-key-v1"
+
+    # 1. Active canary (now <= valid_until)
+    resp_active = CanaryResponse.from_canary(MockCanary, now=now)
+    assert resp_active.canary_sequence == 42
+    assert resp_active.is_current is True
+    assert resp_active.statement_text == MockCanary.statement_text
+    assert resp_active.signature == MockCanary.signature
+    json_data = resp_active.model_dump(mode="json")
+    assert json_data["is_current"] is True
+    assert json_data["canary_sequence"] == 42
+
+    # 2. Expired canary (now > valid_until)
+    future_now = now + timedelta(days=8)
+    resp_expired = CanaryResponse.from_canary(MockCanary, now=future_now)
+    assert resp_expired.is_current is False
+    assert resp_expired.model_dump(mode="json")["is_current"] is False
+
+    # 3. Exact boundary condition (now == valid_until)
+    resp_boundary = CanaryResponse.from_canary(MockCanary, now=MockCanary.valid_until)
+    assert resp_boundary.is_current is True

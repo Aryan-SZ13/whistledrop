@@ -11,8 +11,16 @@ import { ModeratorDashboardPage } from './pages/ModeratorDashboardPage';
 import { ModeratorCaseDetailPage } from './pages/ModeratorCaseDetailPage';
 import { AdminSecurityPage } from './pages/AdminSecurityPage';
 
+const getInitialTab = (): NavTab => {
+  const hash = window.location.hash.replace('#', '') as NavTab;
+  if (['submit', 'track', 'transparency', 'moderator', 'admin'].includes(hash)) {
+    return hash;
+  }
+  return 'submit';
+};
+
 const AppContent: React.FC = () => {
-  const [currentTab, setCurrentTab] = useState<NavTab>('submit');
+  const [currentTab, setCurrentTab] = useState<NavTab>(getInitialTab);
   const [selectedReportId, setSelectedReportId] = useState<string | null>(null);
   const { isAuthenticated } = useAuth();
 

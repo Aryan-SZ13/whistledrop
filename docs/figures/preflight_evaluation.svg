@@ -1,0 +1,115 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 540" width="100%" height="100%" style="background:#0b1120; font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;">
+  <style>
+    .title { font-size: 18px; font-weight: 700; fill: #f8fafc; }
+    .subtitle { font-size: 11px; fill: #94a3b8; }
+    .table-hdr { font-size: 11px; font-weight: 700; fill: #94a3b8; }
+    .cell-txt { font-size: 11px; fill: #e2e8f0; }
+    .cell-bold { font-size: 11px; font-weight: 600; }
+    .dim { fill: #64748b; font-size: 10px; }
+    .caveat-txt { font-size: 9.5px; fill: #94a3b8; font-style: italic; }
+  </style>
+
+  <!-- Title & Heading -->
+  <text x="32" y="34" class="title">WhistleDrop — Privacy Preflight Architectural Trade-Off Analysis</text>
+  <text x="32" y="52" class="subtitle">Design Profile: Deterministic In-Browser Rule Engine vs. In-Browser ML (ONNX) vs. Cloud AI API</text>
+
+  <!-- Summary Metric Cards -->
+  <g transform="translate(32, 70)">
+    <!-- Card 1: Network Exposure -->
+    <rect x="0" y="0" width="186" height="68" rx="6" fill="#1e293b" stroke="#334155" />
+    <text x="14" y="22" class="dim">NETWORK EXPOSURE</text>
+    <text x="14" y="44" font-size="16" font-weight="700" fill="#10b981">0 Bytes (Zero Wire)</text>
+    <text x="14" y="58" class="dim">100% In-Browser Isolation</text>
+
+    <!-- Card 2: Precision -->
+    <rect x="202" y="0" width="186" height="68" rx="6" fill="#1e293b" stroke="#334155" />
+    <text x="216" y="22" class="dim">SYNTHETIC PII PRECISION</text>
+    <text x="216" y="44" font-size="16" font-weight="700" fill="#38bdf8">100.0% Synthetic</text>
+    <text x="216" y="58" class="dim">0 Erroneous Identifications</text>
+
+    <!-- Card 3: Execution Latency -->
+    <rect x="404" y="0" width="186" height="68" rx="6" fill="#1e293b" stroke="#334155" />
+    <text x="418" y="22" class="dim">MEDIAN LATENCY (p50)</text>
+    <text x="418" y="44" font-size="16" font-weight="700" fill="#a855f7">0.016 ms</text>
+    <text x="418" y="58" class="dim">p99 = 0.107 ms (Synchronous)</text>
+
+    <!-- Card 4: Bundle Weight -->
+    <rect x="606" y="0" width="190" height="68" rx="6" fill="#1e293b" stroke="#334155" />
+    <text x="620" y="22" class="dim">CLIENT BUNDLE PENALTY</text>
+    <text x="620" y="44" font-size="16" font-weight="700" fill="#f59e0b">0 KB Model Weight</text>
+    <text x="620" y="58" class="dim">Zero WebGL/WASM Dependency</text>
+  </g>
+
+  <!-- Architectural Trade-Off Comparison Matrix -->
+  <g transform="translate(32, 160)">
+    <rect x="0" y="0" width="796" height="340" rx="8" fill="#0f172a" stroke="#1e293b" />
+
+    <!-- Table Header -->
+    <rect x="0" y="0" width="796" height="38" rx="8" fill="#1e293b" />
+    <text x="20" y="24" class="table-hdr">EVALUATION DIMENSION</text>
+    <text x="250" y="24" class="table-hdr" fill="#38bdf8">WHISTLEDROP PREFLIGHT</text>
+    <text x="460" y="24" class="table-hdr">CLIENT-SIDE ML (ONNX/BERT)</text>
+    <text x="650" y="24" class="table-hdr">CLOUD / SERVER AI API</text>
+
+    <!-- Row 1: Zero-Knowledge Privacy -->
+    <line x1="0" y1="78" x2="796" y2="78" stroke="#1e293b" />
+    <text x="20" y="60" class="cell-bold" fill="#f8fafc">Network Privacy &amp; Wire Leakage</text>
+    <text x="250" y="55" class="cell-bold" fill="#10b981">0 bytes transmitted</text>
+    <text x="250" y="69" class="dim">Pure local browser execution</text>
+    <text x="460" y="55" class="cell-txt">0 bytes (after weight load)</text>
+    <text x="460" y="69" class="dim">Local WASM/WebGL runtime</text>
+    <text x="650" y="55" class="cell-bold" fill="#ef4444">100% Leaked to Cloud</text>
+    <text x="650" y="69" class="dim">Cleartext draft sent to API</text>
+
+    <!-- Row 2: Asset Download Overhead -->
+    <line x1="0" y1="128" x2="796" y2="128" stroke="#1e293b" />
+    <text x="20" y="102" class="cell-bold" fill="#f8fafc">Payload &amp; Bundle Size</text>
+    <text x="250" y="98" class="cell-bold" fill="#10b981">0 KB (Included in Bundle)</text>
+    <text x="250" y="112" class="dim">&lt; 8 KB minified code</text>
+    <text x="460" y="98" class="cell-bold" fill="#ef4444">25 MB – 65 MB Weights</text>
+    <text x="460" y="112" class="dim">Prohibitive over Tor / cellular</text>
+    <text x="650" y="98" class="cell-txt">0 KB client assets</text>
+    <text x="650" y="112" class="dim">Server-side execution</text>
+
+    <!-- Row 3: Execution Latency -->
+    <line x1="0" y1="178" x2="796" y2="178" stroke="#1e293b" />
+    <text x="20" y="152" class="cell-bold" fill="#f8fafc">Scan Latency (Execution Speed)</text>
+    <text x="250" y="148" class="cell-bold" fill="#10b981">&lt; 0.05 ms (Instantaneous)</text>
+    <text x="250" y="162" class="dim">Non-blocking live keystrokes</text>
+    <text x="460" y="148" class="cell-bold" fill="#f59e0b">250 ms – 1,200 ms</text>
+    <text x="460" y="162" class="dim">Causes UI thread hitching</text>
+    <text x="650" y="148" class="cell-bold" fill="#f59e0b">400 ms – 2,500 ms</text>
+    <text x="650" y="162" class="dim">Network RTT + queueing</text>
+
+    <!-- Row 4: Acoustic / Hardware Side-Channels -->
+    <line x1="0" y1="228" x2="796" y2="228" stroke="#1e293b" />
+    <text x="20" y="202" class="cell-bold" fill="#f8fafc">Hardware Side-Channel Risk</text>
+    <text x="250" y="198" class="cell-bold" fill="#10b981">None (Negligible CPU)</text>
+    <text x="250" y="212" class="dim">No GPU spin, no fan noise</text>
+    <text x="460" y="198" class="cell-bold" fill="#ef4444">High (Thermal / Fan Spikes)</text>
+    <text x="460" y="212" class="dim">Acoustic compromise in office</text>
+    <text x="650" y="198" class="cell-txt">None (Server hardware)</text>
+    <text x="650" y="212" class="dim">Local device stays cool</text>
+
+    <!-- Row 5: Precision on Structured Identifiers -->
+    <line x1="0" y1="278" x2="796" y2="278" stroke="#1e293b" />
+    <text x="20" y="252" class="cell-bold" fill="#f8fafc">Structured PII Precision</text>
+    <text x="250" y="248" class="cell-bold" fill="#10b981">100.0% Synthetic</text>
+    <text x="250" y="262" class="dim">Exact boundary matching</text>
+    <text x="460" y="248" class="cell-bold" fill="#f59e0b">~82% – 88% (Estimated)</text>
+    <text x="460" y="262" class="dim">Tokenization boundary errors</text>
+    <text x="650" y="248" class="cell-bold" fill="#f59e0b">~85% – 92% (Estimated)</text>
+    <text x="650" y="262" class="dim">Struggles with internal IDs</text>
+
+    <!-- Row 6: Tor Browser & Hardened Isolation -->
+    <text x="20" y="302" class="cell-bold" fill="#f8fafc">Tor Browser Compatibility</text>
+    <text x="250" y="298" class="cell-bold" fill="#10b981">100% Compatible</text>
+    <text x="250" y="312" class="dim">Standard ES6, no WebGL</text>
+    <text x="460" y="298" class="cell-bold" fill="#ef4444">Broken / Disabled</text>
+    <text x="460" y="312" class="dim">Tor blocks WebGL / WebGPU</text>
+    <text x="650" y="298" class="cell-bold" fill="#ef4444">Compromises Anonymity</text>
+    <text x="650" y="312" class="dim">Correlation attack surface</text>
+  </g>
+  <!-- Caveat Note -->
+  <text x="32" y="525" class="caveat-txt">Note: ML and Cloud columns represent architectural trade-off characteristics and literature profiles. WhistleDrop uses 100% deterministic client-side inspection.</text>
+</svg>

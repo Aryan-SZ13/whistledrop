@@ -123,13 +123,18 @@ class TransparencyService:
         if occurred_at is None:
             occurred_at = datetime.now(timezone.utc)
 
+        # Ensure singleton state row exists with concurrency safety via INSERT ON CONFLICT DO NOTHING
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+        upsert_stmt = (
+            pg_insert(MerkleTreeState)
+            .values(id=1, tree_size=0, next_leaf_index=0)
+            .on_conflict_do_nothing(index_elements=["id"])
+        )
+        await db.execute(upsert_stmt)
+
         # Lock singleton state row to allocate contiguous sequence
         stmt_state = sa.select(MerkleTreeState).where(MerkleTreeState.id == 1).with_for_update()
-        state = (await db.execute(stmt_state)).scalar_one_or_none()
-        if state is None:
-            state = MerkleTreeState(id=1, tree_size=0, next_leaf_index=0)
-            db.add(state)
-            await db.flush()
+        state = (await db.execute(stmt_state)).scalar_one()
 
         assigned_index = state.next_leaf_index
         canonical_bytes = self.compute_canonical_leaf_bytes(

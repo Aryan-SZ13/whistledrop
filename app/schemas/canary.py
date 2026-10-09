@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 import uuid
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -17,6 +17,23 @@ class CanaryResponse(BaseModel):
 
     model_config = ConfigDict(from_attributes=True)
 
+    @classmethod
+    def from_canary(cls, c: Any, now: Optional[datetime] = None) -> "CanaryResponse":
+        if now is None:
+            from datetime import timezone
+            now = datetime.now(timezone.utc)
+        return cls(
+            canary_sequence=c.canary_sequence,
+            statement_text=c.statement_text,
+            statement_hash=c.statement_hash,
+            valid_from=c.valid_from,
+            valid_until=c.valid_until,
+            published_at=c.published_at,
+            is_current=now <= c.valid_until,
+            signature=c.signature,
+            signing_key_id=c.signing_key_id,
+        )
+
 
 class CanaryCreateRequest(BaseModel):
     statement_text: str = Field(..., min_length=20, max_length=5000, description="Full canary statement text")
@@ -28,6 +45,10 @@ class AdminCheckInRequest(BaseModel):
 
 class EmergencySealRequest(BaseModel):
     reason: str = Field(..., min_length=10, max_length=500, description="Justification for emergency sealing")
+
+
+class EmergencyUnsealRequest(BaseModel):
+    totp_code: Optional[str] = Field(None, min_length=6, max_length=6, description="Fresh 6-digit TOTP code verifying administrator identity")
 
 
 class SecurityStateResponse(BaseModel):

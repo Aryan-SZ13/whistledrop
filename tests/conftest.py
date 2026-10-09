@@ -41,7 +41,8 @@ async def clean_database():
             sa.text(
                 "TRUNCATE reports, moderators, report_updates, audit_logs, evidence_attachments, "
                 "case_messages, case_message_moderator_read_state, moderator_sessions, webhook_endpoints, "
-                "outbox_events, webhook_deliveries, quorum_requests CASCADE"
+                "outbox_events, webhook_deliveries, quorum_requests, case_encryption_keys, merkle_leaves, "
+                "merkle_tree_state, signed_tree_heads, warrant_canaries, system_security_state CASCADE"
             )
         )
     yield
@@ -50,7 +51,8 @@ async def clean_database():
             sa.text(
                 "TRUNCATE reports, moderators, report_updates, audit_logs, evidence_attachments, "
                 "case_messages, case_message_moderator_read_state, moderator_sessions, webhook_endpoints, "
-                "outbox_events, webhook_deliveries, quorum_requests CASCADE"
+                "outbox_events, webhook_deliveries, quorum_requests, case_encryption_keys, merkle_leaves, "
+                "merkle_tree_state, signed_tree_heads, warrant_canaries, system_security_state CASCADE"
             )
         )
 

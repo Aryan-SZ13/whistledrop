@@ -1,0 +1,78 @@
+{
+  "dataset_type": "synthetic_annotated_benchmark",
+  "caveat": "Synthetic benchmark results evaluate known target patterns and negative edge cases. They do not establish real-world accuracy on arbitrary human prose.",
+  "total_samples": 58,
+  "clean_negative_samples": 22,
+  "clean_negatives_correct": 22,
+  "clean_accuracy": 1.0,
+  "aggregate": {
+    "true_positives": 45,
+    "false_positives": 0,
+    "false_negatives": 0,
+    "true_negatives": 22,
+    "precision": 1.0,
+    "recall": 1.0,
+    "f1_score": 1.0
+  },
+  "per_category": {
+    "EMAIL": {
+      "expected_instances": 7,
+      "true_positives": 7,
+      "false_positives": 0,
+      "false_negatives": 0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1_score": 1.0
+    },
+    "PHONE": {
+      "expected_instances": 8,
+      "true_positives": 8,
+      "false_positives": 0,
+      "false_negatives": 0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1_score": 1.0
+    },
+    "IP_ADDRESS": {
+      "expected_instances": 6,
+      "true_positives": 6,
+      "false_positives": 0,
+      "false_negatives": 0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1_score": 1.0
+    },
+    "TRACKING_URL": {
+      "expected_instances": 8,
+      "true_positives": 8,
+      "false_positives": 0,
+      "false_negatives": 0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1_score": 1.0
+    },
+    "STRUCTURED_ID": {
+      "expected_instances": 8,
+      "true_positives": 8,
+      "false_positives": 0,
+      "false_negatives": 0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1_score": 1.0
+    },
+    "SELF_IDENTIFIER": {
+      "expected_instances": 8,
+      "true_positives": 8,
+      "false_positives": 0,
+      "false_negatives": 0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1_score": 1.0
+    }
+  },
+  "latency_percentiles_ms": {
+    "p50": 0.0161,
+    "p95": 0.0336,
+    "p99": 0.1074
+  }
+}

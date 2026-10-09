@@ -109,6 +109,17 @@ def test_production_valid_defaults():
         JWT_SECRET="a-very-secure-unique-production-jwt-secret-min32-chars",
         CASE_CODE_SECRET="a-very-secure-unique-production-case-code-secret-min32-chars",
         RATE_LIMIT_KEY_SECRET="a-very-secure-unique-production-rate-limit-secret-min32",
+        CURSOR_SECRET="a-very-secure-unique-production-cursor-secret-min32-chars",
+        AUDIT_CHAIN_SECRET="a-very-secure-unique-production-audit-chain-secret-min32",
+        EVIDENCE_KEK_SECRET="a-very-secure-unique-production-evidence-kek-secret-min32",
+        MFA_KEK_SECRET="a-very-secure-unique-production-mfa-kek-secret-min32-chars",
+        REFRESH_SECRET="a-very-secure-unique-production-refresh-secret-min32-chars",
+        WEBHOOK_KEK_SECRET="a-very-secure-unique-production-webhook-kek-secret-min32",
+        WEBHOOK_SALT="a-very-secure-unique-production-webhook-salt-min32-chars",
+        TRANSPARENCY_SALT="a-very-secure-unique-production-transparency-salt-min32",
+        PAYLOAD_KEK_KEYRING={"1": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
+        EXPORT_SIGNING_KEY_ED25519_PRIVATE="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        CANARY_SIGNING_KEY_ED25519_PRIVATE="abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
     )
     assert cfg.ENV == "production"
     assert cfg.DEBUG is False

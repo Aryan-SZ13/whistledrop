@@ -51,6 +51,7 @@ data/
 *.sqlite3
 *.db
 evidence_storage/
+backup_snapshots/
 
 # Node / Frontend
 frontend/node_modules/

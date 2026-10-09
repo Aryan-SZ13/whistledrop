@@ -1,0 +1,190 @@
+version: "3.8"
+
+# ==============================================================================
+# WhistleDrop Production Topology
+# Architecture:
+#   Public Traffic (HTTPS/HTTP) -> Nginx Reverse Proxy (SSL, Anonymization, Rate Limits)
+#   Internal Isolated Network   -> FastAPI Backend (4 Workers, Non-Root)
+#   Internal Isolated Network   -> PostgreSQL 16 (Encrypted DEKs, Merkle Tree, Outbox)
+#   Internal Isolated Network   -> Redis 7 (Token Blacklist, Sliding Rate Limits)
+#   Internal Isolated Network   -> ClamAV Daemon (Asynchronous Malware Pipeline)
+# ==============================================================================
+
+networks:
+  public_net:
+    driver: bridge
+  internal_net:
+    driver: bridge
+    internal: true
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.28.0.0/24
+
+volumes:
+  postgres_prod_data:
+  redis_prod_data:
+  clamav_prod_data:
+  evidence_prod_data:
+
+services:
+  # ----------------------------------------------------------------------------
+  # Database Tier: PostgreSQL 16 (Strict Internal Isolation)
+  # ----------------------------------------------------------------------------
+  db:
+    image: postgres:16-alpine
+    container_name: whistledrop_prod_db
+    restart: unless-stopped
+    networks:
+      - internal_net
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-whistledrop}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Database password required}
+      POSTGRES_DB: ${POSTGRES_DB:-whistledrop_prod}
+    volumes:
+      - postgres_prod_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-whistledrop} -d ${POSTGRES_DB:-whistledrop_prod}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2048M
+
+  # ----------------------------------------------------------------------------
+  # Caching & Rate-Limiting Tier: Redis 7
+  # ----------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: whistledrop_prod_redis
+    restart: unless-stopped
+    networks:
+      - internal_net
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?Redis password required}"]
+    volumes:
+      - redis_prod_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:?Redis password required}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+  # ----------------------------------------------------------------------------
+  # Antivirus Scanner Tier: ClamAV Daemon
+  # ----------------------------------------------------------------------------
+  clamav:
+    image: clamav/clamav:1.4
+    container_name: whistledrop_prod_clamav
+    restart: unless-stopped
+    networks:
+      - internal_net
+    volumes:
+      - clamav_prod_data:/var/lib/clamav
+    healthcheck:
+      test: ["CMD", "clamdcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 2048M
+
+  # ----------------------------------------------------------------------------
+  # Application Tier: FastAPI Hardened Backend
+  # ----------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: whistledrop_prod_api
+    restart: unless-stopped
+    networks:
+      - internal_net
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      clamav:
+        condition: service_started
+    environment:
+      ENVIRONMENT: production
+      DEBUG: "false"
+      PROJECT_NAME: WhistleDrop
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER:-whistledrop}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Database password required}
+      POSTGRES_DB: ${POSTGRES_DB:-whistledrop_prod}
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?Redis password required}
+      JWT_SECRET: ${JWT_SECRET:?JWT secret required}
+      JWT_ALGORITHM: HS256
+      CASE_CODE_SECRET: ${CASE_CODE_SECRET:?Case code secret required}
+      CLAMAV_HOST: clamav
+      CLAMAV_PORT: "3310"
+      PAYLOAD_KEK_ACTIVE_VERSION: ${PAYLOAD_KEK_ACTIVE_VERSION:-1}
+      PAYLOAD_KEK_KEYRING: ${PAYLOAD_KEK_KEYRING:?KEK Keyring JSON required}
+      EXPORT_SIGNING_KEY_ED25519_PRIVATE: ${EXPORT_SIGNING_KEY_ED25519_PRIVATE:?Ed25519 export private key required}
+      EXPORT_SIGNING_KEY_ED25519_PUBLIC: ${EXPORT_SIGNING_KEY_ED25519_PUBLIC:?Ed25519 export public key required}
+      CANARY_SIGNING_KEY_ED25519_PRIVATE: ${CANARY_SIGNING_KEY_ED25519_PRIVATE:?Ed25519 canary private key required}
+      EVIDENCE_STORAGE_PATH: /app/storage/evidence
+      FORWARDED_ALLOW_IPS: "${FORWARDED_ALLOW_IPS:-127.0.0.1,172.28.0.10}"
+      TRUSTED_PROXY_CIDRS: "${TRUSTED_PROXY_CIDRS:-172.28.0.10/32}"
+      TRUSTED_PROXY_COUNT: "${TRUSTED_PROXY_COUNT:-1}"
+    volumes:
+      - evidence_prod_data:/app/storage/evidence
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2048M
+
+  # ----------------------------------------------------------------------------
+  # Edge / Ingress Tier: Nginx Privacy-Preserving Reverse Proxy
+  # ----------------------------------------------------------------------------
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: whistledrop_prod_nginx
+    restart: unless-stopped
+    networks:
+      public_net:
+      internal_net:
+        ipv4_address: 172.28.0.10
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./deploy/nginx/certs:/etc/nginx/certs:ro
+      - ./frontend/dist:/var/www/html:ro
+    depends_on:
+      - api
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/api/v1/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M

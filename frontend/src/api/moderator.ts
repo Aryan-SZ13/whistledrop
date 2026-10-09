@@ -331,9 +331,10 @@ export async function emergencySeal(
   });
 }
 
-export async function emergencyUnseal(token: string): Promise<{ status: string }> {
+export async function emergencyUnseal(token: string, totpCode?: string): Promise<{ status: string }> {
   return apiRequest('/moderator/security/emergency-unseal', {
     method: 'POST',
     token,
+    body: totpCode ? { totp_code: totpCode } : {},
   });
 }

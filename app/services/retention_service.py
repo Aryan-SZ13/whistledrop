@@ -279,6 +279,19 @@ class RetentionService:
         details: List[Dict[str, Any]] = []
 
         try:
+            # Check sealed state before executing destructive retention
+            async with db_factory() as db:
+                from app.services.canary_service import canary_service
+                if await canary_service.is_system_sealed(db):
+                    logger.warning("Retention sweep skipped: System is in Emergency Sealed mode.")
+                    return RetentionExecuteResponse(
+                        processed_count=0,
+                        shredded_evidence_count=0,
+                        failed_count=0,
+                        lock_acquired=True,
+                        details=[{"status": "SKIPPED_SEALED", "message": "System is in sealed mode; destructive retention disabled."}],
+                    )
+
             # Query candidate report IDs
             now = datetime.now(timezone.utc)
             async with db_factory() as db:

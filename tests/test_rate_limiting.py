@@ -492,6 +492,27 @@ def test_proxy_trust_trusted_peer_extracts_client_ip():
             assert resolved == "203.0.113.88"
 
 
+def test_proxy_trust_pinned_nginx_ip_rejects_other_internal_containers():
+    """Verify pinning TRUSTED_PROXY_CIDRS to dedicated Nginx IP (172.28.0.10/32) prevents other internal containers from spoofing client IPs."""
+    # Production configuration pins specifically to Nginx container IP: 172.28.0.10/32
+    with patch.object(settings, "TRUSTED_PROXY_CIDRS", "172.28.0.10/32"):
+        with patch.object(settings, "TRUSTED_PROXY_COUNT", 1):
+            # 1. Genuine request arriving through pinned Nginx proxy (Client IP -> Nginx Proxy)
+            class NginxProxiedRequest:
+                client = type("Client", (), {"host": "172.28.0.10"})()
+                headers = {"x-forwarded-for": "198.51.100.42, 172.28.0.10"}
+
+            assert resolve_client_ip(NginxProxiedRequest()) == "198.51.100.42"
+
+            # 2. Compromised internal container (e.g., ClamAV / Redis at 172.28.0.5) attempting to spoof client IP
+            class CompromisedInternalContainerRequest:
+                client = type("Client", (), {"host": "172.28.0.5"})()
+                headers = {"x-forwarded-for": "1.1.1.1, 172.28.0.5"}
+
+            # Must reject spoofed X-Forwarded-For and attribute directly to socket peer (172.28.0.5)
+            assert resolve_client_ip(CompromisedInternalContainerRequest()) == "172.28.0.5"
+
+
 def test_ip_canonicalization():
     """Verify IPv4 and IPv6 addresses are canonicalized consistently."""
     # IPv4 normalization (leading zeros stripped)

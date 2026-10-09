@@ -1,0 +1,120 @@
+{
+  "benchmark_metadata": {
+    "date_utc": "2026-10-04 20:06:03",
+    "environment": "Python 3.13 / FastAPI / PostgreSQL 16 (NullPool) / Redis 7",
+    "hardware": "Apple Silicon (macOS) / Multi-threaded Async Runtime",
+    "methodology": "Sequential, single-node local microbenchmarks",
+    "statistical_caveat": "Sample sizes (N=25 to 50) represent local microbenchmark iterations. Calculating p99 from 25-50 sequential observations is statistically preliminary and does not constitute a distributed production latency SLA or multi-node concurrent saturation metric."
+  },
+  "microbenchmarks": [
+    {
+      "operation": "ALEE AES-256-GCM Decryption",
+      "short_name": "ALEE Decrypt",
+      "iterations": 50,
+      "p50_ms": 0.61,
+      "p95_ms": 1.32,
+      "p99_ms": 4.02,
+      "mean_ms": 0.72,
+      "throughput_ops_sec": 1386.7,
+      "target_p95_ms": 10.0
+    },
+    {
+      "operation": "ALEE AES-256-GCM Encryption",
+      "short_name": "ALEE Encrypt",
+      "iterations": 50,
+      "p50_ms": 0.97,
+      "p95_ms": 1.47,
+      "p99_ms": 5.87,
+      "mean_ms": 1.07,
+      "throughput_ops_sec": 933.7,
+      "target_p95_ms": 10.0
+    },
+    {
+      "operation": "Anonymous Case Tracking",
+      "short_name": "Case Tracking",
+      "iterations": 25,
+      "p50_ms": 1.11,
+      "p95_ms": 5.98,
+      "p99_ms": 7.43,
+      "mean_ms": 1.99,
+      "throughput_ops_sec": 501.5,
+      "target_p95_ms": 100.0
+    },
+    {
+      "operation": "Merkle Leaf Commitment",
+      "short_name": "Merkle Leaf",
+      "iterations": 50,
+      "p50_ms": 1.80,
+      "p95_ms": 4.81,
+      "p99_ms": 36.48,
+      "mean_ms": 2.97,
+      "throughput_ops_sec": 336.5,
+      "target_p95_ms": 15.0
+    },
+    {
+      "operation": "Full Report Ingestion Pipeline",
+      "short_name": "Full Ingestion",
+      "iterations": 25,
+      "p50_ms": 8.48,
+      "p95_ms": 20.86,
+      "p99_ms": 28.20,
+      "mean_ms": 10.55,
+      "throughput_ops_sec": 94.8,
+      "target_p95_ms": 300.0
+    }
+  ],
+  "recovery_drill": {
+    "duration_seconds": 0.06,
+    "scope": "Automated 5-tier cryptographic and schema consistency verification drill (not physical cold restore)",
+    "target_rto_seconds": 120.0,
+    "target_rpo_seconds": 60.0,
+    "status": "HEALTHY"
+  },
+  "test_counts": {
+    "backend_total": 343,
+    "backend_files_count": 19,
+    "backend_passing": 343,
+    "frontend_total": 14,
+    "frontend_files_count": 3,
+    "frontend_passing": 14,
+    "total_automated_tests": 357,
+    "subsets_within_backend": {
+      "adversarial_security": {
+        "file": "tests/test_adversarial_security.py",
+        "count": 24,
+        "is_subset_of_backend": true
+      },
+      "concurrency_and_failures": {
+        "file": "tests/test_concurrency_and_failures.py",
+        "count": 4,
+        "is_subset_of_backend": true
+      },
+      "disaster_recovery": {
+        "file": "tests/test_disaster_recovery.py",
+        "count": 5,
+        "is_subset_of_backend": true
+      }
+    },
+    "by_file": {
+      "tests/test_adversarial_security.py": 24,
+      "tests/test_audit_export_retention.py": 27,
+      "tests/test_auth.py": 30,
+      "tests/test_case_communication.py": 17,
+      "tests/test_concurrency_and_failures.py": 4,
+      "tests/test_config.py": 24,
+      "tests/test_database.py": 10,
+      "tests/test_disaster_recovery.py": 5,
+      "tests/test_evidence.py": 35,
+      "tests/test_evidence_config.py": 18,
+      "tests/test_health.py": 5,
+      "tests/test_moderator.py": 24,
+      "tests/test_moderator_advanced.py": 10,
+      "tests/test_observability.py": 17,
+      "tests/test_phase_15_16_17.py": 20,
+      "tests/test_phase_18_19_20.py": 15,
+      "tests/test_rate_limiting.py": 33,
+      "tests/test_reports.py": 17,
+      "tests/test_tracking.py": 8
+    }
+  }
+}
